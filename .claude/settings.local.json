@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npx wrangler d1 execute dev-mid-suggestion-db --remote --env dev --command \"SELECT id, bin_number, bank_id FROM bins WHERE bank_id IS NULL OR bank_id NOT IN \\(SELECT id FROM banks\\);\" --json)",
+      "PowerShell(npx wrangler d1 execute mid-suggestion-db --remote --file=\"C:\\\\Users\\\\User\\\\Downloads\\\\mid-suggestion\\\\dumps\\\\sync_banks_bins_to_prod.sql\" --json)",
+      "PowerShell(npx wrangler d1 export dev-mid-suggestion-db --remote --env dev --table transactions --no-schema --output \"C:\\\\Users\\\\User\\\\Downloads\\\\mid-suggestion\\\\dumps\\\\transactions-data.sql\")",
+      "PowerShell(npx wrangler d1 execute mid-suggestion-db --remote --file=\"C:\\\\Users\\\\User\\\\Downloads\\\\mid-suggestion\\\\dumps\\\\transactions-data.sql\" --json)"
+    ]
+  }
+}

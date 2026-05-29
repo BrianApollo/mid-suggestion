@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mid-suggestion",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-08",
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mid-suggestion-db",
+      "database_id": "8c98ca5a-c36a-4e45-82e0-3efdbb4e4f70",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "services": [
+    { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "env": {
+    "dev": {
+      "triggers": {
+        "crons": ["*/3 * * * *"]
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "dev-mid-suggestion-db",
+          // "database_name": "test-db",
+          "database_id": "39569092-1ca0-4771-a4cc-ac3ef5e1d5ee",
+          // "database_id": "83c11213-332a-4265-8e57-4a79422df839",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "services": [
+        { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+      ],
+      "observability": {
+        "enabled": true
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node scripts/chunk-seed.mjs ./seeds/banks.sql 100)"
+    ]
+  }
+}
