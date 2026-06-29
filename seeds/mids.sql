@@ -5,3 +5,28 @@ INSERT INTO mids (name, merchant_id) VALUES
   ('Cliq - accotta.store - NMI (GOAT - Avidia)', 5),
   ('EMS - accotta.store - NMI (GOAT - BMO Harris)', 7),
   ('Paypal Ennis Fare (None - PayPal)', 11);
+
+  -- INSERT INTO mids (name, merchant_id) VALUES
+  -- ('(Banned) Maverick - www.apolloglobalenterprises.com - NMI (GOAT - Avidia)', 26),
+  -- ('Adquest - Goat -Apollo', 14),
+  -- ('AdQuest Paypal Accusso (None - PayPal)', 35),
+  -- ('BANNED (GOT A REPLACEMENT TO SETUP) GOAT - www.trust-apollo.co - NMI (GOAT -)', 10),
+  -- ('Brian paypal Sandbox', 30),
+  -- ('Celero - trustapollo.store - NMI (Moonlight - Synovus)', 15),
+  -- ('DUPLICATE - www.apolloglobalenterprises.com - NMI (GOAT - ?) NEW', 24),
+  -- ('EMS- trustapollo.store - NMI (Moonlight - Harris)', 21),
+  -- ('Galcier - trustapollo.store - NMI (Moonlight - Mission Valley)', 20),
+  -- ('Luqrapay - www.trustapollo.co - NMI (Luqra - Evolve)', 12),
+  -- ('Maverick - trust-apollo.co - NMI (GOAT- Avidia)', 22),
+  -- ('Maverick - www.apolloglobalenterprises.com - NMI (GOAT - Axiom)', 3),
+  -- ('MiCamp- trustapollo.store - NMI (Moonlight - NABCO)', 16),
+  -- ('Netevia - trustapollo.store - NMI (Moonlight - Evolve)', 17),
+  -- ('PayArc - trust-apollo.store - NMI (MerchantX - Evolve)', 33),
+  -- ('Paypal Accusso (None - PayPal)', 8),
+  -- ('PayPal Apollo', 6),
+  -- ('PayPal ArcaneAdvertising (None - PayPal)', 19),
+  -- ('Paypal LumosBrace (None - PayPal)', 37),
+  -- ('PPS - trustapollo.store - NMI (Moonlight - Synovus)', 13),
+  -- ('QEP 1 - www.trust-apollo.com - NMI (Quantum ePay - Central)', 7),
+  -- ('QEP 2 - www.trust-apollo.com - NMI (Quantum ePay - Fresno)', 9),
+  -- ('SignaPay - www.trust-apollo.co - NMI (GOAT - CBCal)', 11);
