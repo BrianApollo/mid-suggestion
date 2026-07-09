@@ -10,7 +10,7 @@ export async function handleRecompute(request, env, url) {
   return jsonResponse(result);
 }
 
-async function recomputeBankMid(env) {
+export async function recomputeBankMid(env) {
   console.log(`[recompute] snapshotting current bank_mid → ${SNAPSHOT_TABLE}`);
   try {
     await env.DB.prepare(`DROP TABLE IF EXISTS ${SNAPSHOT_TABLE}`).run();

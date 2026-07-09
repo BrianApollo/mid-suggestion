@@ -4,7 +4,7 @@ import {
   handleTransactions,
   ingestTransactions,
 } from "./controllers/transactions/index.js";
-import { handleRecompute } from "./controllers/recompute/index.js";
+import { handleRecompute, recomputeBankMid } from "./controllers/recompute/index.js";
 import { handleBinManagement } from "./controllers/bin-management/index.js";
 
 // Cron ingest pulls a rolling window (yesterday + today, UTC) so late-settling
@@ -12,6 +12,9 @@ import { handleBinManagement } from "./controllers/bin-management/index.js";
 const CRON_INGEST_WINDOW_DAYS = 1;
 const CRON_MAX_CONTINUATIONS = 20;
 const CRON_TIME_BUDGET_MS = 50_000;
+
+// The recompute cron string must match wrangler.jsonc exactly.
+const CRON_RECOMPUTE = "0 */12 * * *";
 
 function utcDateString(offsetDays = 0) {
   return new Date(Date.now() + offsetDays * 86_400_000)
@@ -47,6 +50,19 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    if (event.cron === CRON_RECOMPUTE) {
+      console.log(`[cron] recompute (cron=${event.cron})`);
+      const r = await recomputeBankMid(env);
+      if (r.error) {
+        console.error(`[cron] recompute failed: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`);
+      } else {
+        console.log(
+          `[cron] recompute done — rows=${r.newRows} Σsuccess=${r.totalSuccess} Σfail=${r.totalFail}`
+        );
+      }
+      return;
+    }
+
     const endDate = utcDateString(0);
     const startDate = utcDateString(-CRON_INGEST_WINDOW_DAYS);
     console.log(
