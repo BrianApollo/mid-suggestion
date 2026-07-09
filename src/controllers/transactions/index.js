@@ -258,8 +258,8 @@ async function persistTransactions(env, transactions) {
     `INSERT OR IGNORE INTO transactions (
        cc_transaction_id, date_created, response_type, response_text,
        merchant_id, mid_number, card_bin, card_last4, card_type,
-       order_id, merchant_txn_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       order_id, merchant_txn_id, bill_cycle
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   for (let i = 0; i < finalRows.length; i += PERSIST_CHUNK_SIZE) {
@@ -275,7 +275,8 @@ async function persistTransactions(env, transactions) {
         t.cardLast4 ?? null,
         t.cardType ?? null,
         t.orderId ?? null,
-        t.merchantTxnId ?? null
+        t.merchantTxnId ?? null,
+        t.billingCycleNumber ?? null
       )
     );
     await env.DB.batch(chunk);
