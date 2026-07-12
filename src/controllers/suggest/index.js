@@ -1,62 +1,64 @@
 import { jsonResponse } from "../../lib/http.js";
+import { resolveCompanyId } from "../../lib/company-data.js";
 
+// GET /api/suggest?bin=XXXXXX — the checkout lookup. Feeds back whatever suggestion the
+// last recompute materialised for this company + the BIN's issuing bank. No live compute.
+//
+// NOTE (checkout contract): the response shape { merchant_id, merchant_name, issuer } is
+// UNCHANGED from the original so the checkout page is unaffected; `source`/`allocation` are
+// additive. What changed is the source of truth — it now reads the config-driven `suggestions`
+// table instead of computing from bank_mid live. Deployed to STAGING only; review before live.
 export async function handleSuggest(request, env, url) {
   const bin = url.searchParams.get("bin");
-
   if (!bin || !/^\d{6}$/.test(bin)) {
-    return jsonResponse(
-      { error: "bin must be a 6-digit number" },
-      { status: 400 }
-    );
+    return jsonResponse({ error: "bin must be a 6-digit number" }, { status: 400 });
   }
+  const companyId = await resolveCompanyId(env, request, url);
 
-  const exploration = await env.DB.prepare(
-    `SELECT m.merchant_id, m.name AS merchant_name, ba.name AS issuer
-     FROM bins b
-     JOIN banks ba ON ba.id = b.bank_id
-     JOIN bank_mid bm ON bm.bank_id = b.bank_id
-     JOIN mids m ON m.id = bm.mid_id
-     WHERE b.bin_number = ?
-       AND (
-         (bm.success_count + bm.fail_count) = 0
-         OR (
-           (bm.success_count + bm.fail_count) > 0
-           AND (bm.success_count + bm.fail_count) <= 20
-           AND CAST(bm.success_count AS REAL) / (bm.success_count + bm.fail_count) > 0.5
-         )
-       )`
-  ).bind(bin).all();
-
-  if (exploration.results.length > 0) {
-    const pick = exploration.results[Math.floor(Math.random() * exploration.results.length)];
-    return jsonResponse({
-      merchant_id: pick.merchant_id,
-      merchant_name: pick.merchant_name,
-      issuer: pick.issuer,
-    });
-  }
-
-  const best = await env.DB.prepare(
-    `SELECT m.merchant_id, m.name AS merchant_name, ba.name AS issuer
-     FROM bins b
-     JOIN banks ba ON ba.id = b.bank_id
-     JOIN bank_mid bm ON bm.bank_id = b.bank_id
-     JOIN mids m ON m.id = bm.mid_id
-     WHERE b.bin_number = ?
-     ORDER BY CAST(bm.success_count AS REAL) / NULLIF(bm.success_count + bm.fail_count, 0) DESC
-     LIMIT 1`
+  const bank = await env.DB.prepare(
+    `SELECT b.bank_id, ba.name AS issuer
+     FROM bins b JOIN banks ba ON ba.id = b.bank_id
+     WHERE b.bin_number = ?`
   ).bind(bin).first();
+  if (!bank || bank.bank_id == null) {
+    return jsonResponse({ error: "no issuing bank found for this BIN" }, { status: 404 });
+  }
 
-  if (!best) {
-    return jsonResponse(
-      { error: "no MID found for this BIN" },
-      { status: 404 }
-    );
+  const sugg = await env.DB.prepare(
+    "SELECT allocation_json, source FROM suggestions WHERE company_id = ? AND bank_id = ?"
+  ).bind(companyId, bank.bank_id).first();
+  if (!sugg) {
+    return jsonResponse({ error: "no suggestion for this bank yet — run a recompute" }, { status: 404 });
+  }
+
+  const allocation = JSON.parse(sugg.allocation_json);
+  const midId = pickByWeight(allocation);
+  if (midId == null) {
+    return jsonResponse({ error: "empty allocation" }, { status: 404 });
+  }
+
+  const mid = await env.DB.prepare(
+    "SELECT merchant_id, name AS merchant_name FROM mids WHERE id = ? AND company_id = ?"
+  ).bind(midId, companyId).first();
+  if (!mid) {
+    return jsonResponse({ error: "suggested MID not found" }, { status: 404 });
   }
 
   return jsonResponse({
-    merchant_id: best.merchant_id,
-    merchant_name: best.merchant_name,
-    issuer: best.issuer,
+    merchant_id: mid.merchant_id,
+    merchant_name: mid.merchant_name,
+    issuer: bank.issuer,
+    source: sugg.source,     // additive
+    allocation,              // additive — lets the caller see splits/tests
   });
+}
+
+// A suggestion may be a split/test (multiple MIDs with pct). Pick one by weight per call.
+function pickByWeight(allocation) {
+  if (!allocation || !allocation.length) return null;
+  if (allocation.length === 1) return allocation[0].mid;
+  const total = allocation.reduce((s, a) => s + (a.pct || 0), 0) || 100;
+  let r = Math.random() * total;
+  for (const a of allocation) { r -= (a.pct || 0); if (r <= 0) return a.mid; }
+  return allocation[0].mid;
 }

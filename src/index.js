@@ -6,6 +6,8 @@ import {
 } from "./controllers/transactions/index.js";
 import { handleRecompute, recomputeBankMid } from "./controllers/recompute/index.js";
 import { handleBinManagement } from "./controllers/bin-management/index.js";
+import { handleGetConfig, handleGetVersions, handlePublish } from "./controllers/config/index.js";
+import { handleDashboard } from "./controllers/dashboard/index.js";
 
 // Cron ingest pulls a rolling window (yesterday + today, UTC) so late-settling
 // transactions and timezone boundaries aren't missed. Dedup makes the overlap free.
@@ -30,11 +32,29 @@ export default {
 
     const url = new URL(request.url);
 
+    // ── checkout serving (contract unchanged) ──
     if (url.pathname === "/api/suggest" && request.method === "GET") {
       return handleSuggest(request, env, url);
     }
 
-    if (url.pathname === "/api/transactions" && request.method === "GET") {
+    // ── dashboard config + publish ──
+    if (url.pathname === "/api/config" && request.method === "GET") {
+      return handleGetConfig(request, env, url);
+    }
+    if (url.pathname === "/api/config/versions" && request.method === "GET") {
+      return handleGetVersions(request, env, url);
+    }
+    if (url.pathname === "/api/publish" && request.method === "POST") {
+      return handlePublish(request, env, url);
+    }
+
+    // ── dashboard reads (mids, banks, options, overview-combos, dataset, tables, transactions) ──
+    if (url.pathname.startsWith("/api/") && request.method === "GET" && handleDashboard.handles(url.pathname)) {
+      return handleDashboard(request, env, url);
+    }
+
+    // ── ingest + recompute + bin management (existing) ──
+    if (url.pathname === "/api/transactions" && request.method === "GET" && url.searchParams.has("startDate")) {
       return handleTransactions(request, env, url);
     }
 

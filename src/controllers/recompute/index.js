@@ -1,62 +1,74 @@
 import { jsonResponse } from "../../lib/http.js";
-import { RECOMPUTE_INSERT_SQL, SNAPSHOT_TABLE } from "../transactions/recompute-sql.js";
+import { aggregateOverview } from "../../lib/pipeline.js";
+import { allocate, suggest } from "../../lib/compute.js";
+import { loadCompanyData, loadCurrentConfig, globalBestMid } from "../../lib/company-data.js";
+
+const INSERT_CHUNK = 50;
 
 export async function handleRecompute(request, env, url) {
-  console.log("[recompute] triggered via /api/recompute");
-  const result = await recomputeBankMid(env);
-  if (result.error) {
-    return jsonResponse(result, { status: 500 });
-  }
+  const param = url.searchParams.get("company");
+  const result = param && /^\d+$/.test(param)
+    ? await recomputeCompany(env, parseInt(param, 10))
+    : await recomputeAll(env);
+  if (result.error) return jsonResponse(result, { status: 500 });
   return jsonResponse(result);
 }
 
+// cron entry point — recompute every company that has a published config.
 export async function recomputeBankMid(env) {
-  console.log(`[recompute] snapshotting current bank_mid → ${SNAPSHOT_TABLE}`);
-  try {
-    await env.DB.prepare(`DROP TABLE IF EXISTS ${SNAPSHOT_TABLE}`).run();
-    await env.DB.prepare(
-      `CREATE TABLE ${SNAPSHOT_TABLE} AS SELECT * FROM bank_mid`
-    ).run();
-  } catch (err) {
-    console.error(`[recompute] snapshot failed — bank_mid untouched`, err.message);
-    return { error: "snapshot failed", detail: err.message };
+  return recomputeAll(env);
+}
+
+async function recomputeAll(env) {
+  const companies = (await env.DB.prepare(
+    "SELECT DISTINCT company_id FROM config_versions WHERE is_current = 1"
+  ).all()).results ?? [];
+  const out = [];
+  for (const { company_id } of companies) {
+    out.push({ company_id, ...(await recomputeCompany(env, company_id)) });
   }
+  return { result: "SUCCESS", companies: out };
+}
 
-  const snap = await env.DB.prepare(
-    `SELECT COUNT(*) AS c FROM ${SNAPSHOT_TABLE}`
-  ).first();
-  console.log(`[recompute] snapshot has ${snap.c} rows`);
+// Config-driven recompute for ONE company: read its published config, pull its combos,
+// run the SAME lib the dashboard uses (aggregateOverview + allocate), and materialise
+// bank_mid (counts) + suggestions (the per-bank allocation the checkout serves).
+export async function recomputeCompany(env, companyId) {
+  const config = await loadCurrentConfig(env, companyId);
+  if (!config) return { error: `no current config for company ${companyId}` };
 
-  console.log("[recompute] wiping and rebuilding bank_mid (atomic batch)");
-  try {
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM bank_mid"),
-      env.DB.prepare(RECOMPUTE_INSERT_SQL),
-    ]);
-  } catch (err) {
-    console.error(
-      `[recompute] failed — bank_mid is unchanged (atomic rollback)`,
-      err.message
-    );
-    return {
-      error: "recompute failed",
-      detail: err.message,
-      restoreSql: `INSERT INTO bank_mid SELECT * FROM ${SNAPSHOT_TABLE}`,
-    };
-  }
+  const { combos, banks, mids } = await loadCompanyData(env, companyId);
+  const displayMids = mids.filter((m) => config.phaseA.mids.includes(m.merchantId));
 
-  const after = await env.DB.prepare(
-    `SELECT COUNT(*) AS c, SUM(success_count) AS s, SUM(fail_count) AS f FROM bank_mid`
-  ).first();
-  console.log(
-    `[recompute] done — rows=${after.c} Σsuccess=${after.s ?? 0} Σfail=${after.f ?? 0}`
+  const agg = aggregateOverview(combos, banks, mids, config);
+  const ctx = { globalBest: globalBestMid(agg, displayMids, config.strategy, suggest) };
+  const overrides = {};
+  for (const o of config.overrides || []) overrides[o.bankId] = o;
+
+  const suggIns = env.DB.prepare(
+    "INSERT INTO suggestions (company_id, bank_id, allocation_json, source) VALUES (?, ?, ?, ?)"
+  );
+  const bmIns = env.DB.prepare(
+    "INSERT INTO bank_mid (company_id, bank_id, mid_id, success_count, fail_count) VALUES (?, ?, ?, ?, ?)"
   );
 
-  return {
-    result: "SUCCESS",
-    snapshotRows: snap.c,
-    newRows: after.c,
-    totalSuccess: after.s ?? 0,
-    totalFail: after.f ?? 0,
-  };
+  const suggStmts = [];
+  const bmStmts = [];
+  for (const bank of agg) {
+    const a = allocate(bank.scoreCounts, displayMids, config.strategy, overrides[bank.bankId], ctx);
+    suggStmts.push(suggIns.bind(companyId, bank.bankId, JSON.stringify(a.allocation), a.source));
+    for (const [midId, mc] of Object.entries(bank.counts)) {
+      bmStmts.push(bmIns.bind(companyId, bank.bankId, Number(midId), mc.overall.s, mc.overall.f));
+    }
+  }
+
+  // clear this company's rows, then insert the fresh set (chunked batches).
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM suggestions WHERE company_id = ?").bind(companyId),
+    env.DB.prepare("DELETE FROM bank_mid WHERE company_id = ?").bind(companyId),
+  ]);
+  for (let i = 0; i < suggStmts.length; i += INSERT_CHUNK) await env.DB.batch(suggStmts.slice(i, i + INSERT_CHUNK));
+  for (let i = 0; i < bmStmts.length; i += INSERT_CHUNK) await env.DB.batch(bmStmts.slice(i, i + INSERT_CHUNK));
+
+  return { banksUpdated: agg.length, midRows: bmStmts.length, version: config.version };
 }
