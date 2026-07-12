@@ -16,6 +16,7 @@ handleDashboard.handles = (pathname) => ROUTES.has(pathname) || pathname.startsW
 
 export async function handleDashboard(request, env, url) {
   const companyId = await resolveCompanyId(env, request, url);
+  if (companyId == null) return jsonResponse({ error: "invalid api key" }, { status: 401 });
   const p = url.pathname;
 
   if (p === "/api/mids") {
@@ -57,7 +58,7 @@ export async function handleDashboard(request, env, url) {
               ${cleanText("t.response_text")} AS response_text, t.card_type AS card_type,
               COUNT(*) AS count
        FROM transactions t WHERE t.company_id = ?
-       GROUP BY t.merchant_id, t.response_type, response_text, t.card_type`
+       GROUP BY t.merchant_id, t.response_type, ${cleanText("t.response_text")}, t.card_type`
     ).bind(companyId).all()).results ?? [];
     return jsonResponse({ combos: rows });
   }

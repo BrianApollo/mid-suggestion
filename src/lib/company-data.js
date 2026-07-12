@@ -27,7 +27,7 @@ export async function loadCompanyData(env, companyId) {
     JOIN bins bn ON bn.bin_number = t.card_bin
     JOIN mids m  ON m.merchant_id = t.merchant_id AND m.company_id = t.company_id
     WHERE t.company_id = ? AND bn.bank_id IS NOT NULL
-    GROUP BY bn.bank_id, m.id, t.merchant_id, cyc, t.response_type, response_text, t.card_type, band`;
+    GROUP BY bn.bank_id, m.id, t.merchant_id, cyc, t.response_type, ${cleanText('t.response_text')}, t.card_type, band`;
   const combos = (await env.DB.prepare(comboSql).bind(companyId).all()).results ?? [];
   const banks = (await env.DB.prepare('SELECT id, name FROM banks').all()).results ?? [];
   const mids = ((await env.DB.prepare(
@@ -47,16 +47,18 @@ export async function loadCurrentConfig(env, companyId) {
   return config;
 }
 
-// resolve the company for a request: x-api-key header → companies.api_key, else ?company=<id>, else 1 (staging default).
+// Resolve the company for a request. A supplied-but-invalid x-api-key returns null (caller → 401);
+// no key falls back to ?company=<id>, else 1 (staging single-tenant default — make the key
+// REQUIRED before production, see DASHBOARD-HANDOFF.md).
 export async function resolveCompanyId(env, request, url) {
   const key = request.headers.get('x-api-key');
   if (key) {
     const c = await env.DB.prepare('SELECT id FROM companies WHERE api_key = ?').bind(key).first();
-    if (c) return c.id;
+    return c ? c.id : null;   // present but unmatched → 401, don't silently serve company 1
   }
   const param = url.searchParams.get('company');
   if (param && /^\d+$/.test(param)) return parseInt(param, 10);
-  return 1; // staging default (single tenant). Remove once auth is real.
+  return 1;
 }
 
 // tiny stable string hash (djb2) — used for the phaseA hash (skip re-aggregate when unchanged).

@@ -14,6 +14,7 @@ export async function handleSuggest(request, env, url) {
     return jsonResponse({ error: "bin must be a 6-digit number" }, { status: 400 });
   }
   const companyId = await resolveCompanyId(env, request, url);
+  if (companyId == null) return jsonResponse({ error: "invalid api key" }, { status: 401 });
 
   const bank = await env.DB.prepare(
     `SELECT b.bank_id, ba.name AS issuer

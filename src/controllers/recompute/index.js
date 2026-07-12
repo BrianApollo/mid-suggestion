@@ -3,8 +3,6 @@ import { aggregateOverview } from "../../lib/pipeline.js";
 import { allocate, suggest } from "../../lib/compute.js";
 import { loadCompanyData, loadCurrentConfig, globalBestMid } from "../../lib/company-data.js";
 
-const INSERT_CHUNK = 50;
-
 export async function handleRecompute(request, env, url) {
   const param = url.searchParams.get("company");
   const result = param && /^\d+$/.test(param)
@@ -33,12 +31,14 @@ async function recomputeAll(env) {
 // Config-driven recompute for ONE company: read its published config, pull its combos,
 // run the SAME lib the dashboard uses (aggregateOverview + allocate), and materialise
 // bank_mid (counts) + suggestions (the per-bank allocation the checkout serves).
-export async function recomputeCompany(env, companyId) {
-  const config = await loadCurrentConfig(env, companyId);
+export async function recomputeCompany(env, companyId, config = null) {
+  if (!config) config = await loadCurrentConfig(env, companyId);
   if (!config) return { error: `no current config for company ${companyId}` };
 
   const { combos, banks, mids } = await loadCompanyData(env, companyId);
-  const displayMids = mids.filter((m) => config.phaseA.mids.includes(m.merchantId));
+  // coerce both sides — mids.merchant_id may come back as a string; match isCountable's Number().
+  const want = new Set((config.phaseA.mids || []).map(Number));
+  const displayMids = mids.filter((m) => want.has(Number(m.merchantId)));
 
   const agg = aggregateOverview(combos, banks, mids, config);
   const ctx = { globalBest: globalBestMid(agg, displayMids, config.strategy, suggest) };
@@ -52,8 +52,10 @@ export async function recomputeCompany(env, companyId) {
     "INSERT INTO bank_mid (company_id, bank_id, mid_id, success_count, fail_count) VALUES (?, ?, ?, ?, ?)"
   );
 
-  const suggStmts = [];
-  const bmStmts = [];
+  // Build each table's write as DELETE + all inserts in ONE batch. env.DB.batch is a single
+  // transaction, so the checkout never sees an empty/partial suggestions table mid-recompute.
+  const suggStmts = [env.DB.prepare("DELETE FROM suggestions WHERE company_id = ?").bind(companyId)];
+  const bmStmts = [env.DB.prepare("DELETE FROM bank_mid WHERE company_id = ?").bind(companyId)];
   for (const bank of agg) {
     const a = allocate(bank.scoreCounts, displayMids, config.strategy, overrides[bank.bankId], ctx);
     suggStmts.push(suggIns.bind(companyId, bank.bankId, JSON.stringify(a.allocation), a.source));
@@ -62,13 +64,8 @@ export async function recomputeCompany(env, companyId) {
     }
   }
 
-  // clear this company's rows, then insert the fresh set (chunked batches).
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM suggestions WHERE company_id = ?").bind(companyId),
-    env.DB.prepare("DELETE FROM bank_mid WHERE company_id = ?").bind(companyId),
-  ]);
-  for (let i = 0; i < suggStmts.length; i += INSERT_CHUNK) await env.DB.batch(suggStmts.slice(i, i + INSERT_CHUNK));
-  for (let i = 0; i < bmStmts.length; i += INSERT_CHUNK) await env.DB.batch(bmStmts.slice(i, i + INSERT_CHUNK));
+  await env.DB.batch(suggStmts);   // atomic: old rows replaced by new in one transaction
+  await env.DB.batch(bmStmts);
 
-  return { banksUpdated: agg.length, midRows: bmStmts.length, version: config.version };
+  return { banksUpdated: agg.length, midRows: bmStmts.length - 1, version: config.version };
 }

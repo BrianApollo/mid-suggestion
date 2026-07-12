@@ -48,14 +48,15 @@ export default {
       return handlePublish(request, env, url);
     }
 
+    // ── ingest (must come BEFORE the dashboard reads, which also own /api/transactions) ──
+    // The ingest form carries ?startDate; the dashboard browser form does not.
+    if (url.pathname === "/api/transactions" && request.method === "GET" && url.searchParams.has("startDate")) {
+      return handleTransactions(request, env, url);
+    }
+
     // ── dashboard reads (mids, banks, options, overview-combos, dataset, tables, transactions) ──
     if (url.pathname.startsWith("/api/") && request.method === "GET" && handleDashboard.handles(url.pathname)) {
       return handleDashboard(request, env, url);
-    }
-
-    // ── ingest + recompute + bin management (existing) ──
-    if (url.pathname === "/api/transactions" && request.method === "GET" && url.searchParams.has("startDate")) {
-      return handleTransactions(request, env, url);
     }
 
     if (url.pathname === "/api/recompute" && request.method === "GET") {
