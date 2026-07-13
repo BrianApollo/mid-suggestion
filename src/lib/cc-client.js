@@ -19,6 +19,27 @@ const shortMsg = (p) => {
   return typeof m === "string" ? m.slice(0, 140) : "";
 };
 
+// Pull the company's merchants (MIDs) from CheckoutChamp via the proxy. For now the caller
+// just logs the raw response; mapping it into the `mids` table comes later.
+export async function queryMerchants(env, creds = {}) {
+  if (!env.CC_PROXY) return { ok: false, status: "unreachable", detail: "CC_PROXY not configured" };
+
+  const url = new URL("https://proxy/merchant/query/");
+  applyCreds(url, creds);
+
+  let res, text;
+  try {
+    res = await env.CC_PROXY.fetch(url.toString(), { method: "POST", headers: { Accept: "application/json" } });
+    text = await res.text();
+  } catch (e) {
+    return { ok: false, status: "unreachable", detail: e.message };
+  }
+
+  let data;
+  try { data = JSON.parse(text); } catch { return { ok: false, status: res.status, detail: text.slice(0, 200) }; }
+  return { ok: res.ok, status: res.status, data };
+}
+
 // One lightweight query → a plain connection status the UI can show.
 export async function testCheckoutChamp(env, creds = {}) {
   if (!env.CC_PROXY) return { status: "unreachable", ok: false, detail: "CC_PROXY not configured" };

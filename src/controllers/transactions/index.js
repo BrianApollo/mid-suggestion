@@ -225,7 +225,9 @@ async function persistTransactions(env, transactions, companyId = 1) {
 
   const existingTxIds = new Set();
   if (batchTxIds.length > 0) {
-    const LOOKUP_CHUNK = 100;
+    // D1 caps bound parameters at 100 per query; the `company_id = ?` bind takes one slot,
+    // so keep the IN(...) list at 99 to stay at 100 total.
+    const LOOKUP_CHUNK = 99;
     for (let i = 0; i < batchTxIds.length; i += LOOKUP_CHUNK) {
       const chunk = batchTxIds.slice(i, i + LOOKUP_CHUNK);
       const placeholders = chunk.map(() => "?").join(",");

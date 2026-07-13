@@ -23,7 +23,7 @@
   "env": {
     "dev": {
       "triggers": {
-        "crons": ["*/3 * * * *"]
+        "crons": ["0 */1 * * *", "0 */12 * * *"]
       },
       "d1_databases": [
         {

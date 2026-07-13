@@ -7,7 +7,7 @@ import { handleGetConfig, handleGetVersions, handlePublish } from "./controllers
 import { handleDashboard } from "./controllers/dashboard/index.js";
 import { handleSignup, handleLogin, handleMe } from "./controllers/auth/index.js";
 import { handleGetSettings, handlePutSettings, handleTestConnection } from "./controllers/settings/index.js";
-import { handleCompanyIngest, handleCompanyInit } from "./controllers/onboarding/index.js";
+import { handleCompanyIngest, handleCompanyInit, handleSyncMids } from "./controllers/onboarding/index.js";
 
 // Cron ingest pulls a rolling window (yesterday + today, UTC) so late-settling
 // transactions and timezone boundaries aren't missed. Dedup makes the overlap free.
@@ -45,6 +45,7 @@ export default {
     // ── onboarding: per-company ingest + init ──
     if (url.pathname === "/api/ingest" && request.method === "POST") return handleCompanyIngest(request, env, url);
     if (url.pathname === "/api/company/init" && request.method === "POST") return handleCompanyInit(request, env, url);
+    if (url.pathname === "/api/mids/sync" && request.method === "POST") return handleSyncMids(request, env, url);
 
     // ── checkout serving (contract unchanged) ──
     if (url.pathname === "/api/suggest" && request.method === "GET") {
