@@ -8,6 +8,9 @@ import { handleRecompute, recomputeBankMid } from "./controllers/recompute/index
 import { handleBinManagement } from "./controllers/bin-management/index.js";
 import { handleGetConfig, handleGetVersions, handlePublish } from "./controllers/config/index.js";
 import { handleDashboard } from "./controllers/dashboard/index.js";
+import { handleSignup, handleLogin, handleMe } from "./controllers/auth/index.js";
+import { handleGetSettings, handlePutSettings, handleTestConnection } from "./controllers/settings/index.js";
+import { handleCompanyIngest, handleCompanyInit } from "./controllers/onboarding/index.js";
 
 // Cron ingest pulls a rolling window (yesterday + today, UTC) so late-settling
 // transactions and timezone boundaries aren't missed. Dedup makes the overlap free.
@@ -31,6 +34,20 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // ── auth ──
+    if (url.pathname === "/api/auth/signup" && request.method === "POST") return handleSignup(request, env);
+    if (url.pathname === "/api/auth/login" && request.method === "POST") return handleLogin(request, env);
+    if (url.pathname === "/api/me" && request.method === "GET") return handleMe(request, env);
+
+    // ── settings / connection ──
+    if (url.pathname === "/api/settings" && request.method === "GET") return handleGetSettings(request, env, url);
+    if (url.pathname === "/api/settings" && request.method === "PUT") return handlePutSettings(request, env, url);
+    if (url.pathname === "/api/settings/test" && request.method === "POST") return handleTestConnection(request, env, url);
+
+    // ── onboarding: per-company ingest + init ──
+    if (url.pathname === "/api/ingest" && request.method === "POST") return handleCompanyIngest(request, env, url);
+    if (url.pathname === "/api/company/init" && request.method === "POST") return handleCompanyInit(request, env, url);
 
     // ── checkout serving (contract unchanged) ──
     if (url.pathname === "/api/suggest" && request.method === "GET") {

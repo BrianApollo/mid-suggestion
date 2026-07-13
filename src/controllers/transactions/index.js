@@ -1,4 +1,5 @@
 import { jsonResponse } from "../../lib/http.js";
+import { applyCreds } from "../../lib/cc-client.js";
 
 const PERSIST_CHUNK_SIZE = 100;
 const CC_MAX_PAGE_SIZE = 500;
@@ -65,7 +66,7 @@ export async function handleTransactions(request, env, url) {
 
 export async function ingestTransactions(
   env,
-  { startDate, endDate, startPage = 1, timeBudgetMs = TIME_BUDGET_MS, extraParams = {} }
+  { startDate, endDate, startPage = 1, timeBudgetMs = TIME_BUDGET_MS, extraParams = {}, companyId = 1, creds = {} }
 ) {
   const ccStart = toCheckoutChampDate(startDate);
   const ccEnd = toCheckoutChampDate(endDate);
@@ -87,6 +88,7 @@ export async function ingestTransactions(
   upstream.searchParams.set("resultsPerPage", String(CC_MAX_PAGE_SIZE));
   upstream.searchParams.set("exTestCards", true); // remove test cards
   upstream.searchParams.delete("responseType");
+  applyCreds(upstream, creds); // inject this company's CheckoutChamp login/password (if stored)
 
   const startTime = Date.now();
   let pagesProcessed = 0;
@@ -100,7 +102,7 @@ export async function ingestTransactions(
   console.log(`[txn] starting at page ${startPage} (budget ${timeBudgetMs}ms)`);
 
   for (let page = startPage; page <= MAX_PAGES; page++) {
-    const result = await fetchAndPersistPage(env, upstream, page);
+    const result = await fetchAndPersistPage(env, upstream, page, companyId);
     if (result.error) {
       return {
         error: result.error,
@@ -164,7 +166,7 @@ export async function ingestTransactions(
   };
 }
 
-async function fetchAndPersistPage(env, upstream, page) {
+async function fetchAndPersistPage(env, upstream, page, companyId = 1) {
   upstream.searchParams.set("page", String(page));
   console.log(`[txn] page ${page}: fetching from upstream`);
 
@@ -202,7 +204,7 @@ async function fetchAndPersistPage(env, upstream, page) {
     console.log(`[txn] page 1 sample keys: [${Object.keys(s).join(", ")}]`);
   }
 
-  await persistTransactions(env, rows);
+  await persistTransactions(env, rows, companyId);
   console.log(`[txn] page ${page}: persisted`);
 
   return { page, fetched: rows.length, firstId, lastId, raw: parsed };
@@ -216,7 +218,7 @@ function extractTransactions(parsed) {
   return [];
 }
 
-async function persistTransactions(env, transactions) {
+async function persistTransactions(env, transactions, companyId = 1) {
   if (transactions.length === 0) return;
 
   const batchTxIds = [...new Set(transactions.map((t) => t.transactionId))];
@@ -228,9 +230,9 @@ async function persistTransactions(env, transactions) {
       const chunk = batchTxIds.slice(i, i + LOOKUP_CHUNK);
       const placeholders = chunk.map(() => "?").join(",");
       const res = await env.DB.prepare(
-        `SELECT cc_transaction_id FROM transactions WHERE cc_transaction_id IN (${placeholders})`
+        `SELECT cc_transaction_id FROM transactions WHERE company_id = ? AND cc_transaction_id IN (${placeholders})`
       )
-        .bind(...chunk)
+        .bind(companyId, ...chunk)
         .all();
       for (const row of res.results ?? []) {
         existingTxIds.add(row.cc_transaction_id);
@@ -256,15 +258,16 @@ async function persistTransactions(env, transactions) {
 
   const stmt = env.DB.prepare(
     `INSERT OR IGNORE INTO transactions (
-       cc_transaction_id, date_created, response_type, response_text,
+       company_id, cc_transaction_id, date_created, response_type, response_text,
        merchant_id, mid_number, card_bin, card_last4, card_type,
        order_id, merchant_txn_id, bill_cycle
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   for (let i = 0; i < finalRows.length; i += PERSIST_CHUNK_SIZE) {
     const chunk = finalRows.slice(i, i + PERSIST_CHUNK_SIZE).map((t) =>
       stmt.bind(
+        companyId,
         t.transactionId,
         t.dateCreated,
         t.responseType,

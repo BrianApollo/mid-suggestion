@@ -1,6 +1,16 @@
 // company-data.js — per-company data loads + small helpers shared by the recompute and
 // the dashboard read endpoints. The combo query mirrors the dashboard's /overview-combos:
 // grouped by exactly the rule surface, response_text REFID-stripped, + an age band for recency.
+import { verifyToken } from "./auth.js";
+
+const authSecret = (env) => env.AUTH_SECRET || "staging-fallback-secret-change-me";
+
+// Bearer-token payload ({uid, cid}) or null.
+export async function authPayload(request, env) {
+  const h = request.headers.get("authorization") || "";
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return m ? verifyToken(m[1], authSecret(env)) : null;
+}
 
 // strip the per-txn "REFID:<uid>" tail so ~364 reasons collapse to ~47 clean ones.
 const cleanText = (c) =>
@@ -51,6 +61,11 @@ export async function loadCurrentConfig(env, companyId) {
 // no key falls back to ?company=<id>, else 1 (staging single-tenant default — make the key
 // REQUIRED before production, see DASHBOARD-HANDOFF.md).
 export async function resolveCompanyId(env, request, url) {
+  // logged-in dashboard → Bearer token (present but invalid → 401, never fall through).
+  if (request.headers.get('authorization')) {
+    const payload = await authPayload(request, env);
+    return payload && payload.cid != null ? payload.cid : null;
+  }
   const key = request.headers.get('x-api-key');
   if (key) {
     const c = await env.DB.prepare('SELECT id FROM companies WHERE api_key = ?').bind(key).first();
