@@ -140,7 +140,7 @@ async function browseTable(env, url, companyId, name) {
               LEFT JOIN mids m ON m.id = bm.mid_id
               WHERE bm.company_id = ?) AS sub`, params: [companyId],
     },
-    mids: { expr: `(SELECT id, name, merchant_id FROM mids WHERE company_id = ?) AS sub`, params: [companyId] },
+    mids: { expr: `(SELECT id, name, merchant_id, CASE WHEN is_enabled = 1 THEN 'Enabled' ELSE 'Disabled' END AS status FROM mids WHERE company_id = ?) AS sub`, params: [companyId] },
     banks: { expr: `"banks"`, params: [] },
     bins: { expr: `"bins"`, params: [] },
   };
