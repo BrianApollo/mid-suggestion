@@ -76,6 +76,22 @@ Fixed and deployed:
   unauthenticated `/api/transactions?startDate` ingest route was retired (cron still ingests directly).
 - The seeded staging password is a throwaway — **rotate it before any non-staging use**.
 
+## Multi-tenant CheckoutChamp proxy (fixed)
+
+The `checkout-champ-proxy` overwrote any per-company `loginId`/`password` with its own default
+account (`.set()` unconditionally) → every company pulled Accotta's data (e.g. Sync MIDs returned
+Accotta's merchants). Fix: a duplicate worker **`checkout-champ-proxy-mt/`** (in this repo) that only
+injects the default when the caller passed nothing. **Staging** binds `CC_PROXY` → the duplicate;
+**live** still binds the original (untouched). Long term: apply the 2-line guard to the original and
+drop the duplicate. Verified: same creds, new proxy → the company's own merchants; old proxy → Accotta's.
+
+**Cred-passing audit — every place we call CheckoutChamp:**
+- `/api/settings/test` (`testCheckoutChamp`), `/api/mids/sync` (`queryMerchants`), `/api/ingest`
+  (`ingestTransactions`) — all pass `{login: cc_login, password: cc_password}` ✅ per-company.
+- **The scheduled cron ingest (`index.js`) passes NO creds → default account (Accotta), company 1 only.**
+  New companies' data does NOT auto-refresh on the cron; they rely on "Pull my data" / CSV import.
+  Decision needed: make the cron loop per-company (each with its creds) vs keep it Accotta-only.
+
 ## Deployed (staging)
 
 - Worker: **https://mid-suggestion-dev.management-23c.workers.dev** (`wrangler deploy --env dev`).

@@ -36,7 +36,7 @@
         }
       ],
       "services": [
-        { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+        { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
       ],
       "observability": {
         "enabled": true
