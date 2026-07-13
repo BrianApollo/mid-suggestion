@@ -1,13 +1,14 @@
 import { jsonResponse } from "../../lib/http.js";
 import { aggregateOverview } from "../../lib/pipeline.js";
 import { allocate, suggest } from "../../lib/compute.js";
-import { loadCompanyData, loadCurrentConfig, globalBestMid } from "../../lib/company-data.js";
+import { loadCompanyData, loadCurrentConfig, globalBestMid, resolveCompanyId } from "../../lib/company-data.js";
 
+// HTTP trigger — recomputes ONLY the authenticated caller's company. The all-companies sweep
+// runs from the cron (recomputeBankMid), not over HTTP.
 export async function handleRecompute(request, env, url) {
-  const param = url.searchParams.get("company");
-  const result = param && /^\d+$/.test(param)
-    ? await recomputeCompany(env, parseInt(param, 10))
-    : await recomputeAll(env);
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  const result = await recomputeCompany(env, cid);
   if (result.error) return jsonResponse(result, { status: 500 });
   return jsonResponse(result);
 }

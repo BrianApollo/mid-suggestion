@@ -49,11 +49,17 @@ export async function testCheckoutChamp(env, creds = {}) {
   const result = String(parsed.result ?? parsed.status ?? "").toUpperCase();
   const blob = JSON.stringify(parsed).toLowerCase();
 
-  // "no orders matching those parameters" = the query ran fine, just no data in range → auth OK.
-  const authOk = result === "SUCCESS" || Array.isArray(parsed.message) || parsed.data
-    || /no orders|no transaction|matching those parameters/.test(blob);
-  if (authOk) return { status: "connected", ok: true };
-  if (/login|credential|password|username|invalid.*user|auth/.test(blob)) return { status: "invalid_credentials", ok: false, detail: shortMsg(parsed) };
-  if (/\bip\b|whitelist|not allowed|restrict|forbidden/.test(blob)) return { status: "ip_not_whitelisted", ok: false, detail: shortMsg(parsed) };
+  // Check explicit failures FIRST — CheckoutChamp often wraps errors in a 200 with an empty
+  // data array, so we must not treat truthy [] as success.
+  if (/invalid.*(login|user|credential)|incorrect.*(password|login)|login failed|not authori[sz]ed|unauthori[sz]ed|invalid api/.test(blob))
+    return { status: "invalid_credentials", ok: false, detail: shortMsg(parsed) };
+  if (/whitelist|ip address|not allowed|ip restrict|forbidden|access denied/.test(blob))
+    return { status: "ip_not_whitelisted", ok: false, detail: shortMsg(parsed) };
+
+  // Success: explicit SUCCESS, real data rows, or "no orders in range" (query ran → auth OK).
+  const hasRows = (Array.isArray(parsed.message) && parsed.message.length) || (Array.isArray(parsed.data) && parsed.data.length);
+  if (result === "SUCCESS" || hasRows || /no orders|no transaction|matching those parameters/.test(blob))
+    return { status: "connected", ok: true };
+
   return { status: "other", ok: false, detail: shortMsg(parsed) || `result=${result}` };
 }

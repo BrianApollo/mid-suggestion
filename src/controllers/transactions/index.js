@@ -242,6 +242,7 @@ async function persistTransactions(env, transactions, companyId = 1) {
 
   const seenInBatch = new Set();
   const finalRows = transactions.filter((t) => {
+    if (t.transactionId == null) return false;          // no id → would violate NOT NULL, skip
     if (existingTxIds.has(t.transactionId)) return false;
     if (seenInBatch.has(t.transactionId)) return false;
     seenInBatch.add(t.transactionId);

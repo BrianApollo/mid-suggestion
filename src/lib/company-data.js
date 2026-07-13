@@ -3,7 +3,12 @@
 // grouped by exactly the rule surface, response_text REFID-stripped, + an age band for recency.
 import { verifyToken } from "./auth.js";
 
-const authSecret = (env) => env.AUTH_SECRET || "staging-fallback-secret-change-me";
+// Fail closed — never sign/verify with a hardcoded fallback secret (that would let anyone
+// forge a token). A missing AUTH_SECRET is a deploy misconfig, not something to paper over.
+export function authSecret(env) {
+  if (!env.AUTH_SECRET) throw new Error("AUTH_SECRET is not configured");
+  return env.AUTH_SECRET;
+}
 
 // Bearer-token payload ({uid, cid}) or null.
 export async function authPayload(request, env) {
@@ -60,8 +65,9 @@ export async function loadCurrentConfig(env, companyId) {
 // Resolve the company for a request. A supplied-but-invalid x-api-key returns null (caller → 401);
 // no key falls back to ?company=<id>, else 1 (staging single-tenant default — make the key
 // REQUIRED before production, see DASHBOARD-HANDOFF.md).
+// STRICT — for every tenant-scoped dashboard/settings/onboarding/config endpoint. Requires a
+// valid Bearer token (or a matching api key). No `?company=` and no default: unauthenticated → null (401).
 export async function resolveCompanyId(env, request, url) {
-  // logged-in dashboard → Bearer token (present but invalid → 401, never fall through).
   if (request.headers.get('authorization')) {
     const payload = await authPayload(request, env);
     return payload && payload.cid != null ? payload.cid : null;
@@ -69,7 +75,18 @@ export async function resolveCompanyId(env, request, url) {
   const key = request.headers.get('x-api-key');
   if (key) {
     const c = await env.DB.prepare('SELECT id FROM companies WHERE api_key = ?').bind(key).first();
-    return c ? c.id : null;   // present but unmatched → 401, don't silently serve company 1
+    return c ? c.id : null;
+  }
+  return null;
+}
+
+// PERMISSIVE — for the checkout serving endpoint (/api/suggest) only, which has no dashboard
+// token. Prefers an api key, then ?company, then the legacy company-1 default.
+export async function resolveServingCompanyId(env, request, url) {
+  const key = request.headers.get('x-api-key');
+  if (key) {
+    const c = await env.DB.prepare('SELECT id FROM companies WHERE api_key = ?').bind(key).first();
+    return c ? c.id : null;
   }
   const param = url.searchParams.get('company');
   if (param && /^\d+$/.test(param)) return parseInt(param, 10);

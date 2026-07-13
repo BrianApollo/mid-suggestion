@@ -1,9 +1,10 @@
 import { jsonResponse } from "../../lib/http.js";
 import { hashPassword, verifyPassword, signToken } from "../../lib/auth.js";
-import { authPayload, hashString } from "../../lib/company-data.js";
+import { authPayload, hashString, authSecret } from "../../lib/company-data.js";
 import { defaultConfig } from "../../lib/default-config.js";
 
-const secret = (env) => env.AUTH_SECRET || "staging-fallback-secret-change-me";
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // 30 days
+const mkToken = (env, uid, cid) => signToken({ uid, cid, exp: Date.now() + TOKEN_TTL_MS }, authSecret(env));
 
 // POST /api/auth/signup { email, password, companyName }
 export async function handleSignup(request, env) {
@@ -25,17 +26,24 @@ export async function handleSignup(request, env) {
   const companyId = compRes.meta.last_row_id;
 
   const pw = await hashPassword(password);
-  const userRes = await env.DB.prepare(
-    "INSERT INTO users (email, password_hash, company_id) VALUES (?, ?, ?)"
-  ).bind(email, pw, companyId).run();
-  const uid = userRes.meta.last_row_id;
+  let uid;
+  try {
+    const userRes = await env.DB.prepare(
+      "INSERT INTO users (email, password_hash, company_id) VALUES (?, ?, ?)"
+    ).bind(email, pw, companyId).run();
+    uid = userRes.meta.last_row_id;
+  } catch (_) {
+    // unique(email) lost a race (or any failure) → roll back the orphan company, return 409.
+    await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(companyId).run();
+    return jsonResponse({ error: "an account with this email already exists" }, { status: 409 });
+  }
 
   const cfg = defaultConfig();
   await env.DB.prepare(
     "INSERT INTO config_versions (company_id, version, config_json, phasea_hash, is_current, published_by) VALUES (?, 1, ?, ?, 1, ?)"
   ).bind(companyId, JSON.stringify(cfg), hashString(JSON.stringify(cfg.phaseA)), email).run();
 
-  const token = await signToken({ uid, cid: companyId }, secret(env));
+  const token = await mkToken(env, uid, companyId);
   return jsonResponse({ token, user: { id: uid, companyId, name: companyName } });
 }
 
@@ -52,7 +60,7 @@ export async function handleLogin(request, env) {
   if (!user || !(await verifyPassword(password, user.password_hash))) {
     return jsonResponse({ error: "invalid email or password" }, { status: 401 });
   }
-  const token = await signToken({ uid: user.id, cid: user.company_id }, secret(env));
+  const token = await mkToken(env, user.id, user.company_id);
   return jsonResponse({ token, user: { id: user.id, companyId: user.company_id, name: user.name } });
 }
 

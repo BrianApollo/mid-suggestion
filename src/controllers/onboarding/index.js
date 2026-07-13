@@ -1,5 +1,5 @@
 import { jsonResponse } from "../../lib/http.js";
-import { resolveCompanyId } from "../../lib/company-data.js";
+import { resolveCompanyId, hashString } from "../../lib/company-data.js";
 import { ingestTransactions } from "../transactions/index.js";
 import { recomputeCompany } from "../recompute/index.js";
 
@@ -59,8 +59,8 @@ export async function handleCompanyInit(request, env, url) {
 
   const cfg = JSON.parse(cfgRow.config_json);
   cfg.phaseA.mids = merchantIds;
-  await env.DB.prepare("UPDATE config_versions SET config_json = ? WHERE company_id = ? AND version = ?")
-    .bind(JSON.stringify(cfg), cid, cfgRow.version).run();
+  await env.DB.prepare("UPDATE config_versions SET config_json = ?, phasea_hash = ? WHERE company_id = ? AND version = ?")
+    .bind(JSON.stringify(cfg), hashString(JSON.stringify(cfg.phaseA)), cid, cfgRow.version).run();
 
   const rc = await recomputeCompany(env, cid, { ...cfg, version: cfgRow.version });
   if (rc.error) return jsonResponse({ ok: false, error: rc.error }, { status: 500 });

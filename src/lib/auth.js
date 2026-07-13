@@ -43,8 +43,18 @@ export async function signToken(payload, secret) {
 export async function verifyToken(token, secret) {
   if (!token || !token.includes(".")) return null;
   const [body, sig] = token.split(".");
-  if (sig !== (await hmac(body, secret))) return null;
-  try { return JSON.parse(dec.decode(ub64url(body))); } catch { return null; }
+  if (!timingSafeEqual(sig, await hmac(body, secret))) return null;
+  let payload;
+  try { payload = JSON.parse(dec.decode(ub64url(body))); } catch { return null; }
+  if (payload && payload.exp && Date.now() > payload.exp) return null;   // expired
+  return payload;
+}
+
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
 }
 
 async function hmac(data, secret) {

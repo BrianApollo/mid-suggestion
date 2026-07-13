@@ -1,9 +1,6 @@
 import { CORS_HEADERS } from "./lib/http.js";
 import { handleSuggest } from "./controllers/suggest/index.js";
-import {
-  handleTransactions,
-  ingestTransactions,
-} from "./controllers/transactions/index.js";
+import { ingestTransactions } from "./controllers/transactions/index.js";
 import { handleRecompute, recomputeBankMid } from "./controllers/recompute/index.js";
 import { handleBinManagement } from "./controllers/bin-management/index.js";
 import { handleGetConfig, handleGetVersions, handlePublish } from "./controllers/config/index.js";
@@ -63,12 +60,6 @@ export default {
     }
     if (url.pathname === "/api/publish" && request.method === "POST") {
       return handlePublish(request, env, url);
-    }
-
-    // ── ingest (must come BEFORE the dashboard reads, which also own /api/transactions) ──
-    // The ingest form carries ?startDate; the dashboard browser form does not.
-    if (url.pathname === "/api/transactions" && request.method === "GET" && url.searchParams.has("startDate")) {
-      return handleTransactions(request, env, url);
     }
 
     // ── dashboard reads (mids, banks, options, overview-combos, dataset, tables, transactions) ──

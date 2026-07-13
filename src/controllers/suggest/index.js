@@ -1,5 +1,5 @@
 import { jsonResponse } from "../../lib/http.js";
-import { resolveCompanyId } from "../../lib/company-data.js";
+import { resolveServingCompanyId } from "../../lib/company-data.js";
 
 // GET /api/suggest?bin=XXXXXX — the checkout lookup. Feeds back whatever suggestion the
 // last recompute materialised for this company + the BIN's issuing bank. No live compute.
@@ -13,7 +13,7 @@ export async function handleSuggest(request, env, url) {
   if (!bin || !/^\d{6}$/.test(bin)) {
     return jsonResponse({ error: "bin must be a 6-digit number" }, { status: 400 });
   }
-  const companyId = await resolveCompanyId(env, request, url);
+  const companyId = await resolveServingCompanyId(env, request, url);
   if (companyId == null) return jsonResponse({ error: "invalid api key" }, { status: 401 });
 
   const bank = await env.DB.prepare(

@@ -33,6 +33,49 @@ Preview (UI) == Live (recompute) because it's literally the same code.
 - `src/controllers/suggest/index.js` — now serves the **materialised** suggestion. **Response shape `{merchant_id, merchant_name, issuer}` is UNCHANGED** (`source`/`allocation` added). Review before this reaches live.
 - `src/index.js` — routes wired; ingest `/api/transactions?startDate` is matched before the dashboard browser form.
 
+## Auth & onboarding (added after the first pass)
+
+A company can now self-onboard: sign up → connect CheckoutChamp → pull data → derive MIDs.
+
+- **Auth** (`src/lib/auth.js`, `controllers/auth`): PBKDF2 password hashing + HMAC signed tokens
+  (`{uid, cid}`). `POST /api/auth/signup` (creates company + user + seeds a default config),
+  `POST /api/auth/login`, `GET /api/me`. `resolveCompanyId` reads the Bearer token first
+  (→ 401 if invalid), then `x-api-key`, then `?company=`, else company 1.
+- **Settings / connection** (`controllers/settings`): `GET/PUT /api/settings`,
+  `POST /api/settings/test`. Saves the company's CC login/password, runs a live CheckoutChamp
+  test, and records status (`connected` / `invalid_credentials` / `ip_not_whitelisted` / …).
+- **Onboarding** (`controllers/onboarding`): `POST /api/ingest` (per-company, page-continuation
+  so the UI can show a progress bar; injects the company's own CC creds via `cc-client.applyCreds`)
+  + `POST /api/company/init` (derive mids from their transactions → point the config at them → recompute).
+- **Tenancy guards:** only company 1 (Accotta) may fall back to the proxy's default creds; every
+  other company must supply its own (else it could pull Accotta's data). `migrations/0013` makes
+  transactions `UNIQUE(company_id, cc_transaction_id)` so two companies never collide.
+- **Auth secret:** set as a Worker secret — `wrangler secret put AUTH_SECRET --env dev`. Set one
+  for prod before going live (code falls back to a staging default otherwise).
+- **Login for the demo:** `admin@accotta.com` / `asdf1234` (company 1). New signups start disconnected
+  and are routed to Setup.
+
+**Still to do for real multi-tenant CC:** confirm the `checkout-champ-proxy` honours per-request
+`loginId`/`password` (we pass them; Accotta works via the default). Encrypt `cc_password`
+(currently plain, staging only). Decide the whitelist IP to display (Settings shows `env.WHITELIST_IP`).
+
+## Security hardening (from a review of the auth/onboarding code)
+
+Fixed and deployed:
+- **No unauthenticated tenant access** — `resolveCompanyId` is now STRICT: it requires a valid
+  Bearer token (or matching `x-api-key`) and no longer honours `?company=` or defaults to 1.
+  The checkout `/api/suggest` uses a separate `resolveServingCompanyId` (api-key / `?company` / 1)
+  since it has no dashboard token.
+- **Fail-closed auth secret** — a missing `AUTH_SECRET` now throws instead of using a committed
+  fallback (which would let anyone forge tokens). Set it: `wrangler secret put AUTH_SECRET --env dev`.
+- **Tokens expire** (30d `exp`, checked in `verifyToken`) and the signature compare is constant-time.
+- **Signup is safe** — user insert is wrapped so a duplicate email returns 409 and rolls back the
+  orphan company (no leaked rows); CheckoutChamp connection test no longer reads an empty-array
+  error envelope as "connected".
+- `/api/recompute` now requires auth and recomputes only the caller's company; the legacy
+  unauthenticated `/api/transactions?startDate` ingest route was retired (cron still ingests directly).
+- The seeded staging password is a throwaway — **rotate it before any non-staging use**.
+
 ## Deployed (staging)
 
 - Worker: **https://mid-suggestion-dev.management-23c.workers.dev** (`wrangler deploy --env dev`).
