@@ -218,7 +218,7 @@ function extractTransactions(parsed) {
   return [];
 }
 
-async function persistTransactions(env, transactions, companyId = 1) {
+export async function persistTransactions(env, transactions, companyId = 1) {
   if (transactions.length === 0) return;
 
   const batchTxIds = [...new Set(transactions.map((t) => t.transactionId))];
