@@ -1,0 +1,13 @@
+{
+  "name": "checkout-champ-proxy-mt",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-05-08",
+  "observability": { "enabled": true },
+  // Default CheckoutChamp account — used ONLY when a caller passes no loginId/password.
+  // Replace these placeholders (or set via `wrangler secret put`) before deploying.
+  "vars": {
+    "CC_BASE_URL": "https://api.checkoutchamp.com",
+    "CC_USERNAME": "REPLACE_WITH_DEFAULT_CC_LOGIN",
+    "CC_PASSWORD": "REPLACE_WITH_DEFAULT_CC_PASSWORD"
+  }
+}

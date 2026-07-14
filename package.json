@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --remote --env dev",
     "deploy": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --env dev",
     "db:create": "wrangler d1 create mid-suggestion-db",
     "db:create:dev": "wrangler d1 create dev-mid-suggestion-db",
     "db:migrate": "wrangler d1 migrations apply mid-suggestion-db --remote",

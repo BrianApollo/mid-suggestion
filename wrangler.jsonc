@@ -23,7 +23,7 @@
   "env": {
     "dev": {
       "triggers": {
-        "crons": ["*/3 * * * *"]
+        "crons": ["0 */1 * * *", "0 */12 * * *"]
       },
       "d1_databases": [
         {
@@ -36,7 +36,7 @@
         }
       ],
       "services": [
-        { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+        { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
       ],
       "observability": {
         "enabled": true
