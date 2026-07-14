@@ -70,6 +70,7 @@ export async function handleImportExcel(request, env, url) {
       orderId: get(row, "orderId") || null,
       merchantTxnId: get(row, "txnId") || null,
       billingCycleNumber: /^-?\d+$/.test(billCycle) ? Number(billCycle) : null,
+      txnType: get(row, "type") || null,   // "Sale" → persisted as SALE (upcased in persistTransactions)
     });
   }
 

@@ -6,6 +6,11 @@ const CC_MAX_PAGE_SIZE = 500;
 const MAX_PAGES = 1000;
 const TIME_BUDGET_MS = 25_000;
 
+// CheckoutChamp can't filter by more than one txnType per query, so we pull every type
+// and keep only these in code. Values are matched case-insensitively against the row's
+// txnType field — confirm the exact field name via the "page 1 sample keys" log below.
+const ALLOWED_TXN_TYPES = new Set(["SALE", "AUTHORIZE", "CAPTURE"]);
+
 export async function handleTransactions(request, env, url) {
   const startDate = url.searchParams.get("startDate");
   const endDate = url.searchParams.get("endDate");
@@ -84,7 +89,8 @@ export async function ingestTransactions(
   }
   upstream.searchParams.set("startDate", ccStart);
   upstream.searchParams.set("endDate", ccEnd);
-  upstream.searchParams.set("txnType", "SALE");
+  // No txnType filter here — CC only accepts a single type per query, so we fetch all
+  // types and filter to ALLOWED_TXN_TYPES in code (see fetchAndPersistPage).
   upstream.searchParams.set("resultsPerPage", String(CC_MAX_PAGE_SIZE));
   upstream.searchParams.set("exTestCards", true); // remove test cards
   upstream.searchParams.delete("responseType");
@@ -204,10 +210,16 @@ async function fetchAndPersistPage(env, upstream, page, companyId = 1) {
     console.log(`[txn] page 1 sample keys: [${Object.keys(s).join(", ")}]`);
   }
 
-  await persistTransactions(env, rows, companyId);
-  console.log(`[txn] page ${page}: persisted`);
+  // Keep only the txnTypes we care about. Pagination/loop-detection above still uses the
+  // RAW page (rows.length, firstId, lastId), so a page that filters down to 0 keeps paging.
+  const toPersist = rows.filter((t) =>
+    ALLOWED_TXN_TYPES.has(String(t.txnType ?? t.type ?? "").toUpperCase())
+  );
 
-  return { page, fetched: rows.length, firstId, lastId, raw: parsed };
+  await persistTransactions(env, toPersist, companyId);
+  console.log(`[txn] page ${page}: persisted ${toPersist.length}/${rows.length} (after txnType filter)`);
+
+  return { page, fetched: rows.length, persisted: toPersist.length, firstId, lastId, raw: parsed };
 }
 
 function extractTransactions(parsed) {
@@ -263,8 +275,8 @@ export async function persistTransactions(env, transactions, companyId = 1) {
     `INSERT OR IGNORE INTO transactions (
        company_id, cc_transaction_id, date_created, response_type, response_text,
        merchant_id, mid_number, card_bin, card_last4, card_type,
-       order_id, merchant_txn_id, bill_cycle
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       order_id, merchant_txn_id, bill_cycle, txn_type
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   for (let i = 0; i < finalRows.length; i += PERSIST_CHUNK_SIZE) {
@@ -282,7 +294,8 @@ export async function persistTransactions(env, transactions, companyId = 1) {
         t.cardType ?? null,
         t.orderId ?? null,
         t.merchantTxnId ?? null,
-        t.billingCycleNumber ?? null
+        t.billingCycleNumber ?? null,
+        (t.txnType ?? t.type) ? String(t.txnType ?? t.type).toUpperCase() : null
       )
     );
     await env.DB.batch(chunk);
