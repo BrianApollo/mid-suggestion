@@ -230,76 +230,180 @@ function extractTransactions(parsed) {
   return [];
 }
 
+// D1 caps bound parameters at 100 per query; `company_id = ?` takes one slot, so keep the
+// IN(...) list at 99 to stay at 100 total.
+const LOOKUP_CHUNK = 99;
+const TXN_INSERT_COLS =
+  "company_id, cc_transaction_id, date_created, response_type, response_text, " +
+  "merchant_id, mid_number, card_bin, card_last4, card_type, " +
+  "order_id, merchant_txn_id, bill_cycle, txn_type";
+const TXN_INSERT_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+
+const txnTypeOf = (t) => String(t.txnType ?? t.type ?? "").toUpperCase();
+// Success vs Decline is derived from the CheckoutChamp `result` we store in response_type:
+// "SUCCESS" = success, anything else (SOFT_DECLINE / HARD_DECLINE / …) = decline.
+const isSuccess = (responseType) => String(responseType ?? "").toUpperCase() === "SUCCESS";
+
+function bindInsert(stmt, companyId, t) {
+  return stmt.bind(
+    companyId, t.transactionId, t.dateCreated, t.responseType, t.responseText ?? null,
+    t.merchantId ?? null, t.midNumber ?? null, t.cardBin ?? null, t.cardLast4 ?? null, t.cardType ?? null,
+    t.orderId ?? null, t.merchantTxnId ?? null, t.billingCycleNumber ?? null, txnTypeOf(t) || null
+  );
+}
+
 export async function persistTransactions(env, transactions, companyId = 1) {
   if (transactions.length === 0) return;
 
-  const batchTxIds = [...new Set(transactions.map((t) => t.transactionId))];
-
-  const existingTxIds = new Set();
-  if (batchTxIds.length > 0) {
-    // D1 caps bound parameters at 100 per query; the `company_id = ?` bind takes one slot,
-    // so keep the IN(...) list at 99 to stay at 100 total.
-    const LOOKUP_CHUNK = 99;
-    for (let i = 0; i < batchTxIds.length; i += LOOKUP_CHUNK) {
-      const chunk = batchTxIds.slice(i, i + LOOKUP_CHUNK);
-      const placeholders = chunk.map(() => "?").join(",");
-      const res = await env.DB.prepare(
-        `SELECT cc_transaction_id FROM transactions WHERE company_id = ? AND cc_transaction_id IN (${placeholders})`
-      )
-        .bind(companyId, ...chunk)
-        .all();
-      for (const row of res.results ?? []) {
-        existingTxIds.add(row.cc_transaction_id);
-      }
+  // AUTHORIZE/CAPTURE that carry a merchant_txn_id (the shared trxid) are reconciled by that
+  // trxid through the overwrite state machine. Everything else — SALE, and any auth/capture
+  // with no merchant_txn_id we can't pair — is deduped by cc_transaction_id as before.
+  const independent = [];
+  const authCapture = [];
+  for (const t of transactions) {
+    if (t.transactionId == null) continue;               // NOT NULL guard
+    const type = txnTypeOf(t);
+    if ((type === "AUTHORIZE" || type === "CAPTURE") && t.merchantTxnId) {
+      authCapture.push(t);
+    } else {
+      // Blank billing cycle on a SALE always means cycle 1 (initial sale, preceded by soft
+      // declines that never completed). Only SALE, never rebills (they carry a cycle ≥ 2).
+      if (type === "SALE" && t.billingCycleNumber == null) t.billingCycleNumber = 1;
+      independent.push(t);
     }
   }
 
-  const seenInBatch = new Set();
+  await persistIndependent(env, independent, companyId);
+  await reconcileAuthCapture(env, authCapture, companyId);
+}
+
+// SALE + anything not paired: dedup by cc_transaction_id, insert new rows only (never overwrite).
+async function persistIndependent(env, transactions, companyId) {
+  if (transactions.length === 0) return;
+
+  const batchTxIds = [...new Set(transactions.map((t) => t.transactionId))];
+  const existingTxIds = new Set();
+  for (let i = 0; i < batchTxIds.length; i += LOOKUP_CHUNK) {
+    const chunk = batchTxIds.slice(i, i + LOOKUP_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const res = await env.DB.prepare(
+      `SELECT cc_transaction_id FROM transactions WHERE company_id = ? AND cc_transaction_id IN (${placeholders})`
+    ).bind(companyId, ...chunk).all();
+    for (const row of res.results ?? []) existingTxIds.add(row.cc_transaction_id);
+  }
+
+  const seen = new Set();
   const finalRows = transactions.filter((t) => {
-    if (t.transactionId == null) return false;          // no id → would violate NOT NULL, skip
-    if (existingTxIds.has(t.transactionId)) return false;
-    if (seenInBatch.has(t.transactionId)) return false;
-    seenInBatch.add(t.transactionId);
+    if (existingTxIds.has(t.transactionId) || seen.has(t.transactionId)) return false;
+    seen.add(t.transactionId);
     return true;
   });
-
-  if (finalRows.length !== transactions.length) {
-    console.log(
-      `[txn] persist: skipped ${transactions.length - finalRows.length} rows (cc_transaction_id duplicate)`
-    );
-  }
-
   if (finalRows.length === 0) return;
 
-  const stmt = env.DB.prepare(
-    `INSERT OR IGNORE INTO transactions (
-       company_id, cc_transaction_id, date_created, response_type, response_text,
-       merchant_id, mid_number, card_bin, card_last4, card_type,
-       order_id, merchant_txn_id, bill_cycle, txn_type
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-
+  const stmt = env.DB.prepare(`INSERT OR IGNORE INTO transactions (${TXN_INSERT_COLS}) VALUES (${TXN_INSERT_PLACEHOLDERS})`);
   for (let i = 0; i < finalRows.length; i += PERSIST_CHUNK_SIZE) {
-    const chunk = finalRows.slice(i, i + PERSIST_CHUNK_SIZE).map((t) =>
-      stmt.bind(
-        companyId,
-        t.transactionId,
-        t.dateCreated,
-        t.responseType,
-        t.responseText ?? null,
-        t.merchantId ?? null,
-        t.midNumber ?? null,
-        t.cardBin ?? null,
-        t.cardLast4 ?? null,
-        t.cardType ?? null,
-        t.orderId ?? null,
-        t.merchantTxnId ?? null,
-        t.billingCycleNumber ?? null,
-        (t.txnType ?? t.type) ? String(t.txnType ?? t.type).toUpperCase() : null
-      )
-    );
-    await env.DB.batch(chunk);
+    await env.DB.batch(finalRows.slice(i, i + PERSIST_CHUNK_SIZE).map((t) => bindInsert(stmt, companyId, t)));
   }
+}
+
+// One incoming row folded onto the current state for a trxid. Returns the new state:
+//   { kind:'db', id, ccId, type, success }  — the row already in the DB (no change), or
+//   { kind:'row', type, success, row }      — an incoming row that should be written.
+// Rules: CAPTURE is authoritative; AUTHORIZE-decline is final; never replace a CAPTURE with
+// an AUTHORIZE.
+function stepAuthCapture(state, inc) {
+  const incType = txnTypeOf(inc);
+  const asRow = { kind: "row", type: incType, success: isSuccess(inc.responseType), row: inc };
+  if (!state) return asRow;                     // first row seen for this trxid
+  if (incType === "AUTHORIZE") {
+    if (state.type === "CAPTURE") return state;  // never replace a capture with an authorize
+    return asRow;                                // authorize over authorize → latest wins
+  }
+  // incoming CAPTURE
+  if (state.type === "CAPTURE") return asRow;    // newer capture wins (capture is authoritative)
+  if (!state.success) return state;              // authorize DECLINE is final → ignore the capture
+  return asRow;                                  // authorize SUCCESS → capture overwrites
+}
+
+// Sort a trxid's incoming rows chronologically so the fold sees auth before its capture.
+function cmpAuthCapture(a, b) {
+  const da = String(a.dateCreated ?? ""), db = String(b.dateCreated ?? "");
+  if (da !== db) return da < db ? -1 : 1;
+  const ta = txnTypeOf(a) === "AUTHORIZE" ? 0 : 1;
+  const tb = txnTypeOf(b) === "AUTHORIZE" ? 0 : 1;
+  if (ta !== tb) return ta - tb;
+  return (a.transactionId ?? 0) - (b.transactionId ?? 0);
+}
+
+// AUTHORIZE/CAPTURE reconciliation, keyed by merchant_txn_id. Applies the state machine across
+// what's already stored AND the incoming batch, then inserts new trxids / overwrites changed ones.
+async function reconcileAuthCapture(env, rows, companyId) {
+  if (rows.length === 0) return;
+
+  // Current stored row per trxid (at most one; if legacy data has more, prefer the CAPTURE).
+  const keys = [...new Set(rows.map((t) => t.merchantTxnId))];
+  const existing = new Map();   // merchant_txn_id -> { id, ccId, type, success }
+  for (let i = 0; i < keys.length; i += LOOKUP_CHUNK) {
+    const chunk = keys.slice(i, i + LOOKUP_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const res = await env.DB.prepare(
+      `SELECT id, cc_transaction_id, merchant_txn_id, txn_type, response_type FROM transactions
+       WHERE company_id = ? AND txn_type IN ('AUTHORIZE','CAPTURE') AND merchant_txn_id IN (${placeholders})`
+    ).bind(companyId, ...chunk).all();
+    for (const r of res.results ?? []) {
+      const cand = { id: r.id, ccId: r.cc_transaction_id, type: String(r.txn_type).toUpperCase(), success: isSuccess(r.response_type) };
+      const cur = existing.get(r.merchant_txn_id);
+      if (!cur || (cand.type === "CAPTURE" && cur.type !== "CAPTURE")) existing.set(r.merchant_txn_id, cand);
+    }
+  }
+
+  const groups = new Map();
+  for (const t of rows) {
+    if (!groups.has(t.merchantTxnId)) groups.set(t.merchantTxnId, []);
+    groups.get(t.merchantTxnId).push(t);
+  }
+
+  const toInsert = [];
+  const toUpdate = [];   // { id, row }
+  for (const [key, incoming] of groups) {
+    incoming.sort(cmpAuthCapture);
+    const ex = existing.get(key) || null;
+    let state = ex ? { kind: "db", id: ex.id, ccId: ex.ccId, type: ex.type, success: ex.success } : null;
+    for (const inc of incoming) state = stepAuthCapture(state, inc);
+
+    if (state.kind === "db") continue;                        // winner is the stored row → no change
+    if (ex && state.row.transactionId === ex.ccId) continue;  // same underlying row re-imported → no-op
+    if (ex) toUpdate.push({ id: ex.id, row: state.row });     // overwrite the existing trxid row
+    else toInsert.push(state.row);                            // brand-new trxid
+  }
+
+  if (toInsert.length) {
+    const stmt = env.DB.prepare(`INSERT OR IGNORE INTO transactions (${TXN_INSERT_COLS}) VALUES (${TXN_INSERT_PLACEHOLDERS})`);
+    for (let i = 0; i < toInsert.length; i += PERSIST_CHUNK_SIZE) {
+      await env.DB.batch(toInsert.slice(i, i + PERSIST_CHUNK_SIZE).map((t) => bindInsert(stmt, companyId, t)));
+    }
+  }
+  if (toUpdate.length) {
+    // OR IGNORE: if the capture's cc_transaction_id already exists on another row, skip rather than throw.
+    const upd = env.DB.prepare(
+      `UPDATE OR IGNORE transactions SET
+         cc_transaction_id = ?, date_created = ?, response_type = ?, response_text = ?,
+         merchant_id = ?, mid_number = ?, card_bin = ?, card_last4 = ?, card_type = ?,
+         order_id = ?, bill_cycle = ?, txn_type = ?
+       WHERE id = ?`
+    );
+    for (let i = 0; i < toUpdate.length; i += PERSIST_CHUNK_SIZE) {
+      await env.DB.batch(toUpdate.slice(i, i + PERSIST_CHUNK_SIZE).map(({ id, row: t }) =>
+        upd.bind(
+          t.transactionId, t.dateCreated, t.responseType, t.responseText ?? null,
+          t.merchantId ?? null, t.midNumber ?? null, t.cardBin ?? null, t.cardLast4 ?? null, t.cardType ?? null,
+          t.orderId ?? null, t.billingCycleNumber ?? null, txnTypeOf(t) || null, id
+        )
+      ));
+    }
+  }
+
+  console.log(`[txn] auth/capture reconcile: ${groups.size} trxids → ${toInsert.length} inserted, ${toUpdate.length} overwritten`);
 }
 
 function toCheckoutChampDate(iso) {
