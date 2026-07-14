@@ -9,13 +9,22 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "mid-suggestion-db",
-      "database_id": "8c98ca5a-c36a-4e45-82e0-3efdbb4e4f70",
+      "database_name": "apollo-mid-suggestion-db",
+      "database_id": "7ecc88bc-185e-4058-a040-5cb1ec505d32",
       "migrations_dir": "migrations"
     }
   ],
   "services": [
-    { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+    { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC_DRIVER", "class_name": "SyncDriver" }]
+  },
+  "r2_buckets": [
+    { "binding": "CSV_BUCKET", "bucket_name": "bulktest" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SyncDriver"] }
   ],
   "observability": {
     "enabled": true

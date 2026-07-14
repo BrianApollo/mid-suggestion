@@ -1,226 +1,180 @@
 import { jsonResponse } from "../../lib/http.js";
 import { applyCreds } from "../../lib/cc-client.js";
 
-const PERSIST_CHUNK_SIZE = 100;
-const CC_MAX_PAGE_SIZE = 500;
-const MAX_PAGES = 1000;
-const TIME_BUDGET_MS = 25_000;
+const PERSIST_CHUNK_SIZE = 1000;   // statements per DB.batch() round-trip. D1 caps bound params at
+                                   // 100 PER STATEMENT (each row uses 14, fine) but not per batch,
+                                   // so a fat batch = one round-trip for 1000 rows (~10x fewer trips).
+const CC_PAGE_SIZE = 200;       // CheckoutChamp hard-caps results per page at 200 (higher values are ignored).
+const DAY_CONCURRENCY = 8;      // day-windows fetched in parallel per invocation. CheckoutChamp
+                               // hard-caps at 10 concurrent queries/account (RateLimitError above
+                               // that), so 8 stays under the ceiling with headroom for retries.
+const TIME_BUDGET_MS = 25_000;  // per invocation; resume with ?fromDate=.
+const MAX_DAYS = 1200;          // safety cap on the window list (a few years).
 
 // CheckoutChamp can't filter by more than one txnType per query, so we pull every type
-// and keep only these in code. Values are matched case-insensitively against the row's
-// txnType field — confirm the exact field name via the "page 1 sample keys" log below.
+// and keep only these in code (matched case-insensitively against the row's txnType field).
 const ALLOWED_TXN_TYPES = new Set(["SALE", "AUTHORIZE", "CAPTURE"]);
 
+// GET /api/transactions?startDate=&endDate=&fromDate= — pull CheckoutChamp transactions into the DB.
+//
+// Speed: CheckoutChamp's query cost scales with the *date-range width*, not the page (a 1-year query
+// takes ~38s per page; a 1-day query ~1s). So instead of paginating one year-wide query, we iterate
+// one-day windows, and for each window fetch page 1, read `totalResults`, and drain exactly
+// ceil(totalResults/200) pages — no guessing whether we've reached the end. Days are processed
+// DAY_CONCURRENCY at a time. Time-boxed + resumable: when the budget is hit we return `nextDate`,
+// and the caller re-invokes with ?fromDate=<nextDate>. Idempotent (INSERT OR IGNORE + auth/capture
+// reconcile), so re-running, overlapping, or retrying a day never duplicates or drops anything.
 export async function handleTransactions(request, env, url) {
   const startDate = url.searchParams.get("startDate");
   const endDate = url.searchParams.get("endDate");
-
   if (!startDate || !endDate) {
-    return jsonResponse(
-      { error: "startDate and endDate are required (YYYY-MM-DD)" },
-      { status: 400 }
-    );
+    return jsonResponse({ error: "startDate and endDate are required (YYYY-MM-DD)" }, { status: 400 });
   }
-
-  const startPage = Math.max(
-    1,
-    parseInt(url.searchParams.get("page") ?? "1", 10) || 1
-  );
+  const fromDate = url.searchParams.get("fromDate") || startDate;
 
   const extraParams = {};
   for (const [k, v] of url.searchParams.entries()) {
-    if (k === "startDate" || k === "endDate" || k === "page" || k === "resultsPerPage") continue;
+    if (["startDate", "endDate", "fromDate", "page", "resultsPerPage"].includes(k)) continue;
     extraParams[k] = v;
   }
 
-  const result = await ingestTransactions(env, {
-    startDate,
-    endDate,
-    startPage,
-    extraParams,
-  });
-
-  if (result.error) {
-    return jsonResponse(
-      {
-        error: result.error,
-        detail: result.detail,
-        page: result.page,
-        pagesProcessed: result.pagesProcessed,
-        totalFetched: result.totalFetched,
-        lastPage: result.lastPage,
-      },
-      { status: result.status ?? 502 }
-    );
-  }
+  const result = await ingestTransactions(env, { startDate, endDate, fromDate, extraParams });
+  if (result.error) return jsonResponse(result, { status: result.status ?? 502 });
 
   return jsonResponse({
     result: result.hasMore ? "PARTIAL" : "COMPLETE",
-    startPage: result.startPage,
-    lastPage: result.lastPage,
-    pagesProcessed: result.pagesProcessed,
-    totalFetched: result.totalFetched,
+    startDate,
+    endDate,
+    fromDate,
+    throughDate: result.throughDate,   // last day fully processed this call
+    daysProcessed: result.daysProcessed,
+    totalFetched: result.totalFetched,     // raw rows pulled from CC (= sum of totalResults)
+    totalPersisted: result.totalPersisted, // rows written after txnType filter + dedup/reconcile
+    failedDays: result.failedDays,         // days that errored — safe to re-run (idempotent)
     hasMore: result.hasMore,
-    nextPage: result.nextPage,
-    endedReason: result.endedReason,
+    nextDate: result.nextDate,
     message: result.hasMore
-      ? `Time budget reached. Re-call with ?page=${result.nextPage}&startDate=${startDate}&endDate=${endDate} to continue.`
-      : "Done. Call GET /api/recompute to rebuild bank_mid.",
+      ? `Processed ${fromDate}..${result.throughDate}. Re-call with ?fromDate=${result.nextDate}&startDate=${startDate}&endDate=${endDate} to continue.`
+      : "Done. Call GET /api/recompute to rebuild suggestions.",
   });
 }
 
 export async function ingestTransactions(
   env,
-  { startDate, endDate, startPage = 1, timeBudgetMs = TIME_BUDGET_MS, extraParams = {}, companyId = 1, creds = {} }
+  { startDate, endDate, fromDate, timeBudgetMs = TIME_BUDGET_MS, extraParams = {}, companyId = 1, creds = {}, mode = "missing", onProgress = null }
 ) {
-  const ccStart = toCheckoutChampDate(startDate);
-  const ccEnd = toCheckoutChampDate(endDate);
-  if (!ccStart || !ccEnd) {
-    return { error: "invalid date format, expected YYYY-MM-DD", status: 400 };
-  }
+  if (!env.CC_PROXY) return { error: "CC_PROXY service binding is not configured", status: 500 };
 
-  if (!env.CC_PROXY) {
-    return { error: "CC_PROXY service binding is not configured", status: 500 };
-  }
-
-  const upstream = new URL("https://proxy/transactions/query/");
-  for (const [k, v] of Object.entries(extraParams)) {
-    upstream.searchParams.set(k, v);
-  }
-  upstream.searchParams.set("startDate", ccStart);
-  upstream.searchParams.set("endDate", ccEnd);
-  // No txnType filter here — CC only accepts a single type per query, so we fetch all
-  // types and filter to ALLOWED_TXN_TYPES in code (see fetchAndPersistPage).
-  upstream.searchParams.set("resultsPerPage", String(CC_MAX_PAGE_SIZE));
-  upstream.searchParams.set("exTestCards", true); // remove test cards
-  upstream.searchParams.delete("responseType");
-  applyCreds(upstream, creds); // inject this company's CheckoutChamp login/password (if stored)
+  const days = eachDay(fromDate || startDate, endDate);
+  if (days === null) return { error: "invalid date format, expected YYYY-MM-DD", status: 400 };
+  if (days.length > MAX_DAYS) return { error: `date range too wide (${days.length} days > ${MAX_DAYS})`, status: 400 };
 
   const startTime = Date.now();
-  let pagesProcessed = 0;
-  let totalFetched = 0;
-  let lastPage = startPage - 1;
-  let nextPage = null;
-  let endedReason = "complete";
-  let prevFirstId = null;
-  let prevLastId = null;
+  let totalFetched = 0, totalPersisted = 0, daysProcessed = 0;
+  let nextDate = null, throughDate = null;
+  const failedDays = [];
 
-  console.log(`[txn] starting at page ${startPage} (budget ${timeBudgetMs}ms)`);
+  console.log(`[txn] day-window ingest ${days[0]}..${days.at(-1)} (${days.length} days, ${DAY_CONCURRENCY}-wide, budget ${timeBudgetMs}ms)`);
 
-  for (let page = startPage; page <= MAX_PAGES; page++) {
-    const result = await fetchAndPersistPage(env, upstream, page, companyId);
-    if (result.error) {
-      return {
-        error: result.error,
-        detail: result.detail,
-        page,
-        pagesProcessed,
-        totalFetched,
-        lastPage,
-        status: 502,
-      };
+  for (let i = 0; i < days.length; i += DAY_CONCURRENCY) {
+    if (Date.now() - startTime > timeBudgetMs) { nextDate = days[i]; break; }
+    const batch = days.slice(i, i + DAY_CONCURRENCY);
+
+    // Fetch the batch's days in PARALLEL (fast), but PERSIST once for the whole batch. The reconcile
+    // then folds a trxid's authorize and capture together in a single pass — so an auth on day 1 and
+    // its capture on day 5 can't race each other into a lost capture. (See reconcileAuthCapture.)
+    const fetched = await Promise.all(batch.map((d) => fetchDay(env, d, extraParams, creds)));
+
+    const batchRows = [];
+    for (const f of fetched) {
+      if (f.error) { failedDays.push(f.date); continue; }
+      totalFetched += f.rows.length;
+      batchRows.push(...f.rows.filter((t) => ALLOWED_TXN_TYPES.has(txnTypeOf(t))));
+      daysProcessed++;
+      throughDate = f.date;
     }
-    pagesProcessed++;
-    totalFetched += result.fetched;
-    lastPage = page;
-
-    if (result.fetched === 0) {
-      endedReason = "empty page";
-      break;
+    if (batchRows.length) {
+      await persistTransactions(env, batchRows, companyId, mode);
+      totalPersisted += batchRows.length;
     }
-
-    if (
-      prevFirstId !== null &&
-      result.firstId === prevFirstId &&
-      result.lastId === prevLastId
-    ) {
-      console.warn(
-        `[txn] pagination loop detected at page ${page} — CC returned same window as page ${page - 1}`
-      );
-      endedReason = `pagination loop at page ${page}`;
-      break;
-    }
-    prevFirstId = result.firstId;
-    prevLastId = result.lastId;
-
-    if (page === MAX_PAGES) {
-      endedReason = "MAX_PAGES";
-      break;
-    }
-
-    const elapsed = Date.now() - startTime;
-    if (elapsed > timeBudgetMs) {
-      endedReason = `time budget (${elapsed}ms)`;
-      nextPage = page + 1;
-      break;
-    }
+    // report progress after each ~1-2s day-chunk, so the UI moves right away (not just per batch)
+    if (onProgress) { try { await onProgress({ daysProcessed, totalFetched, totalPersisted, throughDate }); } catch (_) {} }
   }
 
-  const hasMore = nextPage !== null;
-  console.log(
-    `[txn] done — pages ${startPage}-${lastPage} (${pagesProcessed} pages, ${totalFetched} rows), reason: ${endedReason}`
-  );
-
-  return {
-    startPage,
-    lastPage,
-    pagesProcessed,
-    totalFetched,
-    hasMore,
-    nextPage,
-    endedReason,
-  };
+  const hasMore = nextDate !== null;
+  console.log(`[txn] done — ${daysProcessed} days, fetched ${totalFetched}, persisted ${totalPersisted}, failed ${failedDays.length}, hasMore=${hasMore}`);
+  return { startDate, endDate, throughDate, daysProcessed, totalFetched, totalPersisted, failedDays, hasMore, nextDate };
 }
 
-async function fetchAndPersistPage(env, upstream, page, companyId = 1) {
-  upstream.searchParams.set("page", String(page));
-  console.log(`[txn] page ${page}: fetching from upstream`);
-
-  let res;
-  try {
-    res = await env.CC_PROXY.fetch(upstream.toString(), {
-      method: "POST",
-      headers: { Accept: "application/json" },
-    });
-  } catch (err) {
-    return { error: "upstream request failed", detail: err.message, page };
+// Drain ONE day (fetch only, no writes): fetch page 1 to learn totalResults, then pull exactly
+// ceil(totalResults/200) pages so we stop because we HAVE them all, not because a page "looked
+// last". One retry on failure; a still-failing day returns { error } and is reported for re-run.
+async function fetchDay(env, isoDate, extraParams, creds) {
+  const cc = toCheckoutChampDate(isoDate);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const first = await fetchPage(env, cc, 1, extraParams, creds);
+      const total = first.totalResults;
+      let rows = first.rows;
+      const pages = Math.ceil(total / CC_PAGE_SIZE);
+      for (let p = 2; p <= pages; p++) {
+        const r = await fetchPage(env, cc, p, extraParams, creds);
+        rows = rows.concat(r.rows);
+      }
+      if (rows.length < total) {
+        console.warn(`[txn] ${isoDate}: drained ${rows.length}/${total} — short`);
+      }
+      return { date: isoDate, rows, total };
+    } catch (err) {
+      if (attempt === 1) {
+        console.error(`[txn] ${isoDate}: failed after retry — ${err?.message || err}`);
+        return { date: isoDate, error: "day failed", detail: String(err?.message || err), rows: [] };
+      }
+    }
   }
+}
 
+// Fetch a single (day, page) from CheckoutChamp via the proxy. Returns { rows, totalResults }.
+async function fetchPage(env, ccDate, page, extraParams, creds) {
+  const upstream = new URL("https://proxy/transactions/query/");
+  for (const [k, v] of Object.entries(extraParams)) upstream.searchParams.set(k, v);
+  upstream.searchParams.set("startDate", ccDate);
+  upstream.searchParams.set("endDate", ccDate);
+  upstream.searchParams.set("resultsPerPage", String(CC_PAGE_SIZE));
+  upstream.searchParams.set("exTestCards", true);
+  upstream.searchParams.set("page", String(page));
+  upstream.searchParams.delete("responseType");
+  applyCreds(upstream, creds);
+
+  const res = await env.CC_PROXY.fetch(upstream.toString(), { method: "POST", headers: { Accept: "application/json" } });
   const text = await res.text();
   let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return {
-      error: "non-JSON response from upstream",
-      detail: text.slice(0, 200),
-      page,
-    };
-  }
+  try { parsed = JSON.parse(text); }
+  catch { throw new Error(`non-JSON from upstream: ${text.slice(0, 120)}`); }
 
   const rows = extractTransactions(parsed);
-  const firstId = rows[0]?.transactionId ?? null;
-  const lastId = rows.at(-1)?.transactionId ?? null;
-  console.log(
-    `[txn] page ${page}: fetched ${rows.length} rows (first.id=${firstId ?? "—"} last.id=${lastId ?? "—"})`
-  );
-
-  if (page === 1 && rows.length > 0) {
-    const s = rows[0];
-    console.log(`[txn] page 1 sample keys: [${Object.keys(s).join(", ")}]`);
-  }
-
-  // Keep only the txnTypes we care about. Pagination/loop-detection above still uses the
-  // RAW page (rows.length, firstId, lastId), so a page that filters down to 0 keeps paging.
-  const toPersist = rows.filter((t) =>
-    ALLOWED_TXN_TYPES.has(String(t.txnType ?? t.type ?? "").toUpperCase())
-  );
-
-  await persistTransactions(env, toPersist, companyId);
-  console.log(`[txn] page ${page}: persisted ${toPersist.length}/${rows.length} (after txnType filter)`);
-
-  return { page, fetched: rows.length, persisted: toPersist.length, firstId, lastId, raw: parsed };
+  const msg = parsed?.message;
+  const totalResults = msg && typeof msg === "object" && Number.isFinite(msg.totalResults) ? msg.totalResults : rows.length;
+  return { rows, totalResults };
 }
+
+// ── date helpers (UTC calendar days) ─────────────────────────────────────────
+function eachDay(startISO, endISO) {
+  const s = parseISO(startISO), e = parseISO(endISO);
+  if (!s || !e) return null;
+  const out = [];
+  for (let d = s; d <= e && out.length <= MAX_DAYS; d = addDays(d, 1)) out.push(fmtISO(d));
+  return out;
+}
+function parseISO(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return null;
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+}
+function fmtISO(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+function addDays(d, n) { const x = new Date(d); x.setUTCDate(x.getUTCDate() + n); return x; }
 
 function extractTransactions(parsed) {
   if (Array.isArray(parsed)) return parsed;
@@ -252,7 +206,7 @@ function bindInsert(stmt, companyId, t) {
   );
 }
 
-export async function persistTransactions(env, transactions, companyId = 1) {
+export async function persistTransactions(env, transactions, companyId = 1, mode = "missing") {
   if (transactions.length === 0) return;
 
   // AUTHORIZE/CAPTURE that carry a merchant_txn_id (the shared trxid) are reconciled by that
@@ -273,36 +227,51 @@ export async function persistTransactions(env, transactions, companyId = 1) {
     }
   }
 
-  await persistIndependent(env, independent, companyId);
+  await persistIndependent(env, independent, companyId, mode);
   await reconcileAuthCapture(env, authCapture, companyId);
 }
 
-// SALE + anything not paired: dedup by cc_transaction_id, insert new rows only (never overwrite).
-async function persistIndependent(env, transactions, companyId) {
+// Columns to refresh when overwriting an existing row (everything except the identity + created_at).
+const TXN_UPSERT_SET = [
+  "date_created", "response_type", "response_text", "merchant_id", "mid_number",
+  "card_bin", "card_last4", "card_type", "order_id", "merchant_txn_id", "bill_cycle", "txn_type",
+].map((c) => `${c} = excluded.${c}`).join(", ");
+
+// SALE + anything not paired, deduped by cc_transaction_id.
+//   mode "missing"   (default): INSERT OR IGNORE — existing rows untouched, only new ones added.
+//   mode "overwrite":           upsert — refresh existing rows' fields with the latest pull. Use it
+//                               to fix a bad/old import (we don't store chargeback/refund status,
+//                               so there's little a stored sale row otherwise changes into).
+// (The AUTHORIZE/CAPTURE reconcile below is unaffected by mode — a capture always wins over its auth.)
+async function persistIndependent(env, transactions, companyId, mode = "missing") {
   if (transactions.length === 0) return;
 
-  const batchTxIds = [...new Set(transactions.map((t) => t.transactionId))];
-  const existingTxIds = new Set();
-  for (let i = 0; i < batchTxIds.length; i += LOOKUP_CHUNK) {
-    const chunk = batchTxIds.slice(i, i + LOOKUP_CHUNK);
-    const placeholders = chunk.map(() => "?").join(",");
-    const res = await env.DB.prepare(
-      `SELECT cc_transaction_id FROM transactions WHERE company_id = ? AND cc_transaction_id IN (${placeholders})`
-    ).bind(companyId, ...chunk).all();
-    for (const row of res.results ?? []) existingTxIds.add(row.cc_transaction_id);
-  }
-
+  // dedup within this batch (keep the first row per cc_transaction_id)
   const seen = new Set();
-  const finalRows = transactions.filter((t) => {
-    if (existingTxIds.has(t.transactionId) || seen.has(t.transactionId)) return false;
-    seen.add(t.transactionId);
-    return true;
-  });
-  if (finalRows.length === 0) return;
+  let rows = transactions.filter((t) => (seen.has(t.transactionId) ? false : (seen.add(t.transactionId), true)));
 
-  const stmt = env.DB.prepare(`INSERT OR IGNORE INTO transactions (${TXN_INSERT_COLS}) VALUES (${TXN_INSERT_PLACEHOLDERS})`);
-  for (let i = 0; i < finalRows.length; i += PERSIST_CHUNK_SIZE) {
-    await env.DB.batch(finalRows.slice(i, i + PERSIST_CHUNK_SIZE).map((t) => bindInsert(stmt, companyId, t)));
+  if (mode !== "overwrite") {
+    // update-missing: drop rows already stored (avoids re-binding them; OR IGNORE would skip anyway)
+    const ids = [...seen];
+    const existing = new Set();
+    for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
+      const chunk = ids.slice(i, i + LOOKUP_CHUNK);
+      const res = await env.DB.prepare(
+        `SELECT cc_transaction_id FROM transactions WHERE company_id = ? AND cc_transaction_id IN (${chunk.map(() => "?").join(",")})`
+      ).bind(companyId, ...chunk).all();
+      for (const r of res.results ?? []) existing.add(r.cc_transaction_id);
+    }
+    rows = rows.filter((t) => !existing.has(t.transactionId));
+  }
+  if (rows.length === 0) return;
+
+  const sql = mode === "overwrite"
+    ? `INSERT INTO transactions (${TXN_INSERT_COLS}) VALUES (${TXN_INSERT_PLACEHOLDERS})
+       ON CONFLICT(company_id, cc_transaction_id) DO UPDATE SET ${TXN_UPSERT_SET}`
+    : `INSERT OR IGNORE INTO transactions (${TXN_INSERT_COLS}) VALUES (${TXN_INSERT_PLACEHOLDERS})`;
+  const stmt = env.DB.prepare(sql);
+  for (let i = 0; i < rows.length; i += PERSIST_CHUNK_SIZE) {
+    await env.DB.batch(rows.slice(i, i + PERSIST_CHUNK_SIZE).map((t) => bindInsert(stmt, companyId, t)));
   }
 }
 

@@ -31,6 +31,9 @@ const ageBand = (c) => `CASE
   ELSE 'old' END`;
 
 // { combos, banks, mids } for one company — the input to aggregateOverview + allocate.
+// `banks` is trimmed to ONLY the banks referenced by the combos (not all ~19k rows): the
+// aggregation only ever produces rows for banks that appear in the combos, so the trimmed
+// set is exactly sufficient. Both callers (recompute + dashboard /overview-combos) want this.
 export async function loadCompanyData(env, companyId) {
   const comboSql = `
     SELECT bn.bank_id AS bank_id, m.id AS mid_id, t.merchant_id AS merchant_id,
@@ -44,11 +47,31 @@ export async function loadCompanyData(env, companyId) {
     WHERE t.company_id = ? AND bn.bank_id IS NOT NULL
     GROUP BY bn.bank_id, m.id, t.merchant_id, cyc, t.response_type, ${cleanText('t.response_text')}, t.card_type, band`;
   const combos = (await env.DB.prepare(comboSql).bind(companyId).all()).results ?? [];
-  const banks = (await env.DB.prepare('SELECT id, name FROM banks').all()).results ?? [];
-  const mids = ((await env.DB.prepare(
+  const bankIds = [...new Set(combos.map((c) => c.bank_id).filter((x) => x != null))];
+  const banks = await loadBanksByIds(env, bankIds);
+  const mids = await loadCompanyMids(env, companyId);
+  return { combos, banks, mids };
+}
+
+// Only the named banks (id,name), chunked ≤99 per IN() to stay under D1's 100-param cap.
+async function loadBanksByIds(env, ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 99) {
+    const chunk = ids.slice(i, i + 99);
+    if (!chunk.length) break;
+    const ph = chunk.map(() => '?').join(',');
+    const rows = (await env.DB.prepare(`SELECT id, name FROM banks WHERE id IN (${ph})`).bind(...chunk).all()).results ?? [];
+    out.push(...rows);
+  }
+  return out;
+}
+
+// The company's MIDs as {id,name,merchantId}. Small table; cheap to load on its own on the
+// cache-hit recompute path (which skips the combo scan but still needs displayMids).
+export async function loadCompanyMids(env, companyId) {
+  return ((await env.DB.prepare(
     'SELECT id, name, merchant_id FROM mids WHERE company_id = ? ORDER BY merchant_id'
   ).bind(companyId).all()).results ?? []).map((r) => ({ id: r.id, name: r.name, merchantId: r.merchant_id }));
-  return { combos, banks, mids };
 }
 
 // the current published config for a company (or null). Parses config_json.
@@ -60,6 +83,45 @@ export async function loadCurrentConfig(env, companyId) {
   const config = JSON.parse(row.config_json);
   config.version = row.version;
   return config;
+}
+
+// A specific config version for a company (or null). Used by the background recompute, which
+// must recompute against the just-published version (stored is_current=0) — NOT the still-live
+// current one — and only flip is_current after it succeeds.
+export async function loadConfigVersion(env, companyId, version) {
+  const row = await env.DB.prepare(
+    'SELECT config_json, version FROM config_versions WHERE company_id = ? AND version = ?'
+  ).bind(companyId, version).first();
+  if (!row) return null;
+  const config = JSON.parse(row.config_json);
+  config.version = row.version;
+  return config;
+}
+
+// Cache key for the recency weighting. Recency lives in strategy but IS applied inside
+// aggregateOverview (it produces scoreCounts), so it must be part of the aggregation's identity.
+// When disabled, scoreCounts === counts regardless of the weights → key is a constant.
+export function recencyKey(strategy) {
+  const r = strategy && strategy.recency;
+  if (!r || !r.enabled) return 'off';
+  return hashString(JSON.stringify(r.weights || {}));
+}
+
+// A cheap-but-sufficient signature of everything (besides phaseA + recency) that feeds the combo
+// aggregation: the transactions rows and the mids rows. Identical fingerprint ⟹ identical combos.
+//   transactions: COUNT (insert/delete), MAX(id) (any insert bumps the autoincrement),
+//                 MAX(updated_at) (the AFTER-UPDATE trigger touches it on every row change).
+//   mids:         a hash of (id,merchant_id) rows — the join/display keys; tiny table.
+// Bank NAMES are deliberately excluded: they aren't written to suggestions/bank_mid and only
+// affect agg sort order, which can't change the final row SET (both tables are PK'd).
+export async function txFingerprint(env, companyId) {
+  const t = await env.DB.prepare(
+    "SELECT COUNT(*) AS n, COALESCE(MAX(id),0) AS mx, COALESCE(MAX(updated_at),'') AS mu FROM transactions WHERE company_id = ?"
+  ).bind(companyId).first();
+  const midRows = (await env.DB.prepare(
+    'SELECT id, merchant_id FROM mids WHERE company_id = ? ORDER BY id'
+  ).bind(companyId).all()).results ?? [];
+  return `${t.n}:${t.mx}:${t.mu}|${hashString(JSON.stringify(midRows))}`;
 }
 
 // Resolve the company for a request. A supplied-but-invalid x-api-key returns null (caller → 401);
