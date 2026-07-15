@@ -97,32 +97,52 @@ export default {
 
     const endDate = utcDateString(0);
     const startDate = utcDateString(-CRON_INGEST_WINDOW_DAYS);
+
+    const companies = (await env.DB.prepare(
+      "SELECT id, cc_login, cc_password FROM companies WHERE cc_login IS NOT NULL OR id = 1 ORDER BY id"
+    ).all()).results ?? [];
+
     console.log(
-      `[cron] transactions ingest ${startDate}..${endDate} (cron=${event.cron})`
+      `[cron] transactions ingest ${startDate}..${endDate} for ${companies.length} companies (cron=${event.cron})`
     );
 
-    let page = 1;
-    let total = 0;
-    for (let i = 0; i < CRON_MAX_CONTINUATIONS; i++) {
-      const r = await ingestTransactions(env, {
-        startDate,
-        endDate,
-        startPage: page,
-        timeBudgetMs: CRON_TIME_BUDGET_MS,
-      });
-      if (r.error) {
-        console.error(
-          `[cron] ingest failed at page ${r.page ?? page}: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`
-        );
-        return;
+    let grandTotal = 0;
+    for (const c of companies) {
+      const creds = { login: c.cc_login, password: c.cc_password };
+      let page = 1;
+      let total = 0;
+      let failed = false;
+      for (let i = 0; i < CRON_MAX_CONTINUATIONS; i++) {
+        const r = await ingestTransactions(env, {
+          startDate,
+          endDate,
+          startPage: page,
+          timeBudgetMs: CRON_TIME_BUDGET_MS,
+          companyId: c.id,
+          creds,
+        });
+        if (r.error) {
+          console.error(
+            `[cron] company ${c.id} ingest failed at page ${r.page ?? page}: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`
+          );
+          failed = true;
+          break;
+        }
+        total += r.totalFetched;
+        if (!r.hasMore) break;
+        page = r.nextPage;
       }
-      total += r.totalFetched;
-      if (!r.hasMore) break;
-      page = r.nextPage;
+      if (!failed) {
+        await env.DB.prepare(
+          "UPDATE companies SET last_ingest_at = datetime('now') WHERE id = ?"
+        ).bind(c.id).run();
+      }
+      grandTotal += total;
+      console.log(`[cron] company ${c.id}: ${total} rows`);
     }
 
     console.log(
-      `[cron] transactions ingest complete — ${total} rows for ${startDate}..${endDate}`
+      `[cron] transactions ingest complete — ${grandTotal} rows across ${companies.length} companies for ${startDate}..${endDate}`
     );
   },
 };
