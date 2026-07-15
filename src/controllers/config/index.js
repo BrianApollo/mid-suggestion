@@ -1,7 +1,6 @@
 import { jsonResponse } from "../../lib/http.js";
 import { validateConfig } from "../../lib/validate.js";
 import { loadCurrentConfig, resolveCompanyId, hashString } from "../../lib/company-data.js";
-import { recomputeCompany } from "../recompute/index.js";
 
 // GET /api/config → the company's current published config (404 if none yet).
 export async function handleGetConfig(request, env, url) {
@@ -41,19 +40,19 @@ export async function handlePublish(request, env, url) {
   ).bind(companyId).first();
   const version = (prev?.v ?? 0) + 1;
 
-  // Store the new version as NOT current, recompute with it, and only flip `is_current`
-  // AFTER a successful recompute — so a failed publish never leaves a live-but-broken config.
+  // Store the new version as NOT current, then run the (potentially slow) recompute IN THE
+  // BACKGROUND via the per-company publish DO. The DO flips `is_current` to this version only
+  // AFTER a successful recompute — so a failed publish never leaves a live-but-broken config,
+  // and this request returns instantly. The UI polls /api/publish/status until it's done.
   await env.DB.prepare(
     "INSERT INTO config_versions (company_id, version, config_json, phasea_hash, is_current, published_by) VALUES (?, ?, ?, ?, 0, ?)"
   ).bind(companyId, version, JSON.stringify(config), phaseaHash, body.publishedBy ?? null).run();
 
-  const rc = await recomputeCompany(env, companyId, { ...config, version });
-  if (rc.error) return jsonResponse({ ok: false, version, error: rc.error }, { status: 500 });
+  const stub = env.SYNC_DRIVER.get(env.SYNC_DRIVER.idFromName("publish:" + companyId));
+  await stub.fetch("https://do/start", {
+    method: "POST",
+    body: JSON.stringify({ source: "recompute", companyId, version }),
+  });
 
-  await env.DB.batch([
-    env.DB.prepare("UPDATE config_versions SET is_current = 0 WHERE company_id = ?").bind(companyId),
-    env.DB.prepare("UPDATE config_versions SET is_current = 1 WHERE company_id = ? AND version = ?").bind(companyId, version),
-  ]);
-
-  return jsonResponse({ ok: true, version, summary: { banksUpdated: rc.banksUpdated } });
+  return jsonResponse({ ok: true, recomputing: true, version });
 }

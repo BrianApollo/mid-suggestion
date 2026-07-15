@@ -1,4 +1,6 @@
-import { CORS_HEADERS } from "./lib/http.js";
+import { CORS_HEADERS, jsonResponse } from "./lib/http.js";
+import { resolveCompanyId } from "./lib/company-data.js";
+import { SyncDriver } from "./controllers/sync-driver/index.js";
 import { handleSuggest } from "./controllers/suggest/index.js";
 import { ingestTransactions } from "./controllers/transactions/index.js";
 import { handleRecompute, recomputeBankMid } from "./controllers/recompute/index.js";
@@ -8,7 +10,8 @@ import { handleDashboard } from "./controllers/dashboard/index.js";
 import { handleSignup, handleLogin, handleMe } from "./controllers/auth/index.js";
 import { handleGetSettings, handlePutSettings, handleTestConnection } from "./controllers/settings/index.js";
 import { handleCompanyIngest, handleCompanyInit, handleSyncMids } from "./controllers/onboarding/index.js";
-import { handleImportExcel } from "./controllers/import-excel/index.js";
+import { handleImportExcel, handleImportR2 } from "./controllers/import-excel/index.js";
+import { handleUploadCreate, handleUploadPart, handleUploadComplete } from "./controllers/upload/index.js";
 
 // Cron ingest pulls a rolling window (yesterday + today, UTC) so late-settling
 // transactions and timezone boundaries aren't missed. Dedup makes the overlap free.
@@ -24,6 +27,59 @@ function utcDateString(offsetDays = 0) {
     .toISOString()
     .slice(0, 10);
 }
+
+// ── background pull route handlers (delegate to the per-company SyncDriver DO) ──
+async function handleSyncStart(request, env, url) {
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  const mode = url.searchParams.get("mode") === "overwrite" ? "overwrite" : "missing";
+  const stub = env.SYNC_DRIVER.get(env.SYNC_DRIVER.idFromName("company:" + cid));
+
+  // source=r2: process a CSV already uploaded to the bucket (walk-away big-file import).
+  // Otherwise: the day-window CheckoutChamp API pull.
+  let body;
+  if (url.searchParams.get("source") === "r2") {
+    const key = url.searchParams.get("key");
+    if (!key) return jsonResponse({ error: "key is required for source=r2" }, { status: 400 });
+    body = { source: "r2", companyId: cid, key, mode };
+  } else {
+    body = {
+      companyId: cid,
+      startDate: url.searchParams.get("startDate") || utcDateString(-365),
+      endDate: url.searchParams.get("endDate") || utcDateString(0),
+      mode,
+    };
+  }
+  const resp = await stub.fetch("https://do/start", { method: "POST", body: JSON.stringify(body) });
+  return jsonResponse(await resp.json());
+}
+
+async function handleSyncStatus(request, env, url) {
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  const stub = env.SYNC_DRIVER.get(env.SYNC_DRIVER.idFromName("company:" + cid));
+  const resp = await stub.fetch("https://do/status");
+  return jsonResponse(await resp.json());
+}
+
+// Poll the background publish/recompute job for a company (its own DO instance, "publish:<cid>").
+async function handlePublishStatus(request, env, url) {
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  const stub = env.SYNC_DRIVER.get(env.SYNC_DRIVER.idFromName("publish:" + cid));
+  const resp = await stub.fetch("https://do/status");
+  return jsonResponse(await resp.json());
+}
+
+async function handleSyncCancel(request, env, url) {
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  const stub = env.SYNC_DRIVER.get(env.SYNC_DRIVER.idFromName("company:" + cid));
+  const resp = await stub.fetch("https://do/cancel", { method: "POST" });
+  return jsonResponse(await resp.json());
+}
+
+export { SyncDriver };
 
 export default {
   async fetch(request, env, ctx) {
@@ -48,6 +104,17 @@ export default {
     if (url.pathname === "/api/company/init" && request.method === "POST") return handleCompanyInit(request, env, url);
     if (url.pathname === "/api/mids/sync" && request.method === "POST") return handleSyncMids(request, env, url);
     if (url.pathname === "/api/import-excel" && request.method === "POST") return handleImportExcel(request, env, url);
+    if (url.pathname === "/api/import-r2" && request.method === "POST") return handleImportR2(request, env, url);
+
+    // ── R2 multipart upload (push a file of any size into the bucket past the ~100MB body cap) ──
+    if (url.pathname === "/api/upload/create" && request.method === "POST") return handleUploadCreate(request, env, url);
+    if (url.pathname === "/api/upload/part" && request.method === "PUT") return handleUploadPart(request, env, url);
+    if (url.pathname === "/api/upload/complete" && request.method === "POST") return handleUploadComplete(request, env, url);
+
+    // ── background pull (Durable Object driver): start once, close the tab, poll status ──
+    if (url.pathname === "/api/sync/start" && request.method === "POST") return handleSyncStart(request, env, url);
+    if (url.pathname === "/api/sync/status" && request.method === "GET") return handleSyncStatus(request, env, url);
+    if (url.pathname === "/api/sync/cancel" && request.method === "POST") return handleSyncCancel(request, env, url);
 
     // ── checkout serving (contract unchanged) ──
     if (url.pathname === "/api/suggest" && request.method === "GET") {
@@ -63,6 +130,9 @@ export default {
     }
     if (url.pathname === "/api/publish" && request.method === "POST") {
       return handlePublish(request, env, url);
+    }
+    if (url.pathname === "/api/publish/status" && request.method === "GET") {
+      return handlePublishStatus(request, env, url);
     }
 
     // ── dashboard reads (mids, banks, options, overview-combos, dataset, tables, transactions) ──
@@ -98,51 +168,35 @@ export default {
     const endDate = utcDateString(0);
     const startDate = utcDateString(-CRON_INGEST_WINDOW_DAYS);
 
+    // Per-company: pull each company that has its own CheckoutChamp creds, using those creds.
+    // Company 1 is always included (legacy: on the single-tenant deploy it falls back to the
+    // proxy's default account when it has no stored creds).
     const companies = (await env.DB.prepare(
-      "SELECT id, cc_login, cc_password FROM companies WHERE cc_login IS NOT NULL OR id = 1 ORDER BY id"
+      "SELECT id, cc_login, cc_password FROM companies WHERE id = 1 OR (cc_login IS NOT NULL AND cc_login != '')"
     ).all()).results ?? [];
+    console.log(`[cron] transactions ingest ${startDate}..${endDate} for ${companies.length} companies (cron=${event.cron})`);
 
-    console.log(
-      `[cron] transactions ingest ${startDate}..${endDate} for ${companies.length} companies (cron=${event.cron})`
-    );
-
-    let grandTotal = 0;
-    for (const c of companies) {
-      const creds = { login: c.cc_login, password: c.cc_password };
-      let page = 1;
+    for (const co of companies) {
+      let fromDate = startDate;
       let total = 0;
-      let failed = false;
       for (let i = 0; i < CRON_MAX_CONTINUATIONS; i++) {
         const r = await ingestTransactions(env, {
           startDate,
           endDate,
-          startPage: page,
+          fromDate,
           timeBudgetMs: CRON_TIME_BUDGET_MS,
-          companyId: c.id,
-          creds,
+          companyId: co.id,
+          creds: { login: co.cc_login, password: co.cc_password },
         });
         if (r.error) {
-          console.error(
-            `[cron] company ${c.id} ingest failed at page ${r.page ?? page}: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`
-          );
-          failed = true;
+          console.error(`[cron] company ${co.id} ingest failed at ${r.nextDate ?? fromDate}: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`);
           break;
         }
         total += r.totalFetched;
         if (!r.hasMore) break;
-        page = r.nextPage;
+        fromDate = r.nextDate;
       }
-      if (!failed) {
-        await env.DB.prepare(
-          "UPDATE companies SET last_ingest_at = datetime('now') WHERE id = ?"
-        ).bind(c.id).run();
-      }
-      grandTotal += total;
-      console.log(`[cron] company ${c.id}: ${total} rows`);
+      console.log(`[cron] company ${co.id} ingest — ${total} rows for ${startDate}..${endDate}`);
     }
-
-    console.log(
-      `[cron] transactions ingest complete — ${grandTotal} rows across ${companies.length} companies for ${startDate}..${endDate}`
-    );
   },
 };

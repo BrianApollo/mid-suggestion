@@ -7,9 +7,9 @@ import { queryMerchants } from "../../lib/cc-client.js";
 const utcDate = (offsetDays = 0) =>
   new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
 
-// POST /api/ingest?page=N&startDate&endDate — pull ONE time-budgeted batch of this company's
-// transactions (using their creds), tagged company_id. The UI loops page=nextPage until !hasMore,
-// showing progress from totalStored. Defaults to the last year → today.
+// POST /api/ingest?fromDate=&startDate&endDate — pull ONE time-budgeted batch of this company's
+// transactions (using their creds), tagged company_id, using the day-window sync. The UI loops
+// fromDate=nextDate until !hasMore, showing progress from totalStored. Defaults to last year → today.
 export async function handleCompanyIngest(request, env, url) {
   const cid = await resolveCompanyId(env, request, url);
   if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
@@ -21,10 +21,10 @@ export async function handleCompanyIngest(request, env, url) {
   }
   const startDate = url.searchParams.get("startDate") || utcDate(-365);
   const endDate = url.searchParams.get("endDate") || utcDate(0);
-  const startPage = Math.max(1, parseInt(url.searchParams.get("page"), 10) || 1);
+  const fromDate = url.searchParams.get("fromDate") || startDate;   // resume cursor (day-window)
 
   const r = await ingestTransactions(env, {
-    startDate, endDate, startPage, companyId: cid,
+    startDate, endDate, fromDate, companyId: cid,
     creds: { login: c?.cc_login, password: c?.cc_password },
   });
   if (r.error) return jsonResponse(r, { status: r.status ?? 502 });

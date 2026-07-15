@@ -1,120 +1,104 @@
 import { jsonResponse } from "../../lib/http.js";
 import { resolveCompanyId } from "../../lib/company-data.js";
 import { persistTransactions } from "../transactions/index.js";
+import { createCsvParser, parseHeader, mapRow } from "./csv.js";
 
-// POST /api/import-excel — import a CheckoutChamp "Transaction Details" CSV export into the
-// transactions table (tagged to the caller's company). Send the CSV as the raw request body.
-// Only `type == Sale` rows are imported (mirrors the live ingest's txnType=SALE). Rows are
-// deduped against existing ones by cc_transaction_id, so re-importing is safe.
+// CSV import of a CheckoutChamp "Transaction Details" export into the transactions table.
+//   POST /api/import-excel?mode=missing|overwrite   — CSV as the raw request body (direct upload)
+//   POST /api/import-r2?key=<obj>&mode=…            — CSV already sitting in the R2 bucket
 //
-// NOTE: .xlsx is a binary format we can't parse in a Worker without a library — export/convert
-// the sheet to CSV first (the frontend can do this before POSTing).
+// Both feed the SAME streaming engine (streamImport): the body is parsed incrementally and persisted
+// in batches, so the whole file is never held in memory. Rows kept: Sale (initials) + Authorize /
+// Capture (rebill attempt + settlement); Refund/Void skipped. The same persist path as the API sync
+// runs — auth/capture reconcile, blank-cycle → 1, dedup — so it's identical data either way.
+//
+// NOTE: a direct POST is capped by Cloudflare's request-body limit (~100-500 MB by plan). The R2
+// path has no such cap (upload straight to the bucket), but a file big enough to exceed one Worker
+// invocation's time still needs the resumable/background version (TODO).
 
-// Columns we read from the export header (by name, so column order/extra columns don't matter).
-const REQUIRED = [
-  "date", "type", "result", "response", "merchantId", "mid",
-  "cardBin", "cardLast4", "cardType", "orderId", "txnId", "billCycle", "transactionId",
-];
+const PERSIST_BATCH = 2000;
 
-// "Success" → SUCCESS, "Soft Decline" → SOFT_DECLINE, "Hard Decline" → HARD_DECLINE
-const normType = (s) => String(s || "").trim().toUpperCase().replace(/\s+/g, "_");
+// ── the shared streaming engine: consume a ReadableStream of CSV text, persist as we go ──
+async function streamImport(env, stream, cid, mode) {
+  let col = null, headerFound = false, fatal = null;
+  let parsed = 0, eligible = 0, skippedType = 0, skippedInvalid = 0, sentToDb = 0;
+  let batch = [];
 
+  const flush = async () => {
+    if (!batch.length) return;
+    await persistTransactions(env, batch, cid, mode);
+    sentToDb += batch.length;
+    batch = [];
+  };
+
+  const onRow = (row) => {
+    if (fatal) return;
+    if (!headerFound) {
+      const h = parseHeader(row);
+      if (!h) return;                              // still in the preamble
+      if (h.error) { fatal = h.error; return; }
+      col = h.col; headerFound = true;
+      return;
+    }
+    const m = mapRow(row, col);
+    if (m.skip === "notxnid") return;
+    parsed++;
+    if (m.skip === "type") { skippedType++; return; }
+    if (m.skip === "invalid") { skippedInvalid++; return; }
+    eligible++;
+    batch.push(m.txn);
+  };
+
+  const parser = createCsvParser();
+  const reader = stream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let first = true;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    let text = decoder.decode(value, { stream: true });
+    if (first && text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    first = false;
+    parser.feed(text, onRow);
+    if (fatal) { try { await reader.cancel(); } catch (_) {} break; }
+    if (batch.length >= PERSIST_BATCH) await flush();
+  }
+  if (!fatal) parser.finish(onRow);
+  if (!fatal) await flush();
+
+  return { fatal, headerFound, mode, parsed, eligible, imported: sentToDb, skippedNonSale: skippedType, skippedInvalid };
+}
+
+function respond(r) {
+  if (r.fatal) return jsonResponse({ error: r.fatal }, { status: 400 });
+  if (!r.headerFound) return jsonResponse({ error: "could not find the header row (expected a column named 'date')" }, { status: 400 });
+  return jsonResponse({ ok: true, mode: r.mode, parsed: r.parsed, eligible: r.eligible, imported: r.imported, skippedNonSale: r.skippedNonSale, skippedInvalid: r.skippedInvalid });
+}
+
+// POST /api/import-excel — CSV in the raw request body.
 export async function handleImportExcel(request, env, url) {
   const cid = await resolveCompanyId(env, request, url);
   if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
-
-  const text = await request.text();
-  if (!text || !text.trim()) {
-    return jsonResponse({ error: "empty body — POST the CSV export as the request body" }, { status: 400 });
-  }
-
-  const rows = parseCsv(text);
-  // The export has a preamble ("Transaction Details", "Date Range …") before the header row.
-  const headerIdx = rows.findIndex((r) => (r[0] || "").trim().toLowerCase() === "date");
-  if (headerIdx === -1) {
-    return jsonResponse({ error: "could not find the header row (expected a column named 'date')" }, { status: 400 });
-  }
-
-  const header = rows[headerIdx].map((h) => h.trim());
-  const col = {};
-  header.forEach((h, i) => { if (!(h in col)) col[h] = i; });   // first occurrence wins
-  const missing = REQUIRED.filter((c) => !(c in col));
-  if (missing.length) return jsonResponse({ error: `missing columns: ${missing.join(", ")}` }, { status: 400 });
-
-  const get = (row, name) => { const v = row[col[name]]; return v == null ? "" : v.trim(); };
-
-  let parsed = 0, eligible = 0, skippedNonSale = 0, skippedInvalid = 0;
-  const mapped = [];
-  for (const row of rows.slice(headerIdx + 1)) {
-    const txnId = get(row, "transactionId");
-    if (!/^\d+$/.test(txnId)) continue;              // blank line / trailing "Total" row → skip
-    parsed++;
-    if (get(row, "type").toLowerCase() !== "sale") { skippedNonSale++; continue; }
-    const dateCreated = get(row, "date");
-    const responseType = normType(get(row, "result"));
-    if (!dateCreated || !responseType) { skippedInvalid++; continue; }   // NOT NULL guard
-    eligible++;
-
-    const merchantId = get(row, "merchantId");
-    const billCycle = get(row, "billCycle");
-    mapped.push({
-      transactionId: Number(txnId),
-      dateCreated,
-      responseType,
-      responseText: get(row, "response") || null,
-      merchantId: /^\d+$/.test(merchantId) ? Number(merchantId) : null,
-      midNumber: get(row, "mid") || null,
-      cardBin: get(row, "cardBin") || null,
-      cardLast4: get(row, "cardLast4") || null,
-      cardType: get(row, "cardType") || null,
-      orderId: get(row, "orderId") || null,
-      merchantTxnId: get(row, "txnId") || null,
-      billingCycleNumber: /^-?\d+$/.test(billCycle) ? Number(billCycle) : null,
-      txnType: get(row, "type") || null,   // "Sale" → persisted as SALE (upcased in persistTransactions)
-    });
-  }
-
-  const countSql = "SELECT COUNT(*) n FROM transactions WHERE company_id = ?";
-  const before = (await env.DB.prepare(countSql).bind(cid).first()).n;
-  await persistTransactions(env, mapped, cid);       // dedup + INSERT OR IGNORE, same path as ingest
-  const after = (await env.DB.prepare(countSql).bind(cid).first()).n;
-  const inserted = after - before;
-
-  console.log(`[import] company ${cid} — parsed=${parsed} eligible=${eligible} inserted=${inserted}`);
-  return jsonResponse({
-    ok: true,
-    parsed,                            // data rows with a numeric transactionId
-    eligible,                          // type == Sale and non-null date/result
-    inserted,                          // new rows written
-    duplicates: eligible - inserted,   // already present (deduped by cc_transaction_id)
-    skippedNonSale,                    // type != Sale
-    skippedInvalid,                    // missing date or result
-  });
+  if (!request.body) return jsonResponse({ error: "empty body — POST the CSV export as the request body" }, { status: 400 });
+  const mode = url.searchParams.get("mode") === "overwrite" ? "overwrite" : "missing";
+  const r = await streamImport(env, request.body, cid, mode);
+  console.log(`[import] company ${cid} — body mode=${mode} parsed=${r.parsed} eligible=${r.eligible} sentToDb=${r.imported}`);
+  return respond(r);
 }
 
-// Minimal RFC-4180 CSV parser: handles quoted fields, embedded commas/newlines, and "" escapes.
-function parseCsv(text) {
-  const rows = [];
-  let row = [], field = "", inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; }   // escaped quote
-        else inQuotes = false;
-      } else field += c;
-    } else if (c === '"') {
-      inQuotes = true;
-    } else if (c === ",") {
-      row.push(field); field = "";
-    } else if (c === "\r") {
-      // ignore — handled by \n
-    } else if (c === "\n") {
-      row.push(field); rows.push(row); row = []; field = "";
-    } else {
-      field += c;
-    }
-  }
-  if (field.length || row.length) { row.push(field); rows.push(row); }
-  return rows;
+// POST /api/import-r2?key=<object>&mode= — CSV already uploaded to the R2 bucket.
+export async function handleImportR2(request, env, url) {
+  const cid = await resolveCompanyId(env, request, url);
+  if (cid == null) return jsonResponse({ error: "not authenticated" }, { status: 401 });
+  if (!env.CSV_BUCKET) return jsonResponse({ error: "R2 bucket not configured" }, { status: 500 });
+  const key = url.searchParams.get("key");
+  if (!key) return jsonResponse({ error: "key is required (?key=<object in the bucket>)" }, { status: 400 });
+  const mode = url.searchParams.get("mode") === "overwrite" ? "overwrite" : "missing";
+
+  const obj = await env.CSV_BUCKET.get(key);
+  if (!obj) return jsonResponse({ error: `object not found in bucket: ${key}` }, { status: 404 });
+
+  const r = await streamImport(env, obj.body, cid, mode);
+  console.log(`[import] company ${cid} — r2 key=${key} mode=${mode} size=${obj.size} parsed=${r.parsed} eligible=${r.eligible} sentToDb=${r.imported}`);
+  return respond({ ...r, key, size: obj.size });
 }

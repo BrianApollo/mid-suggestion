@@ -38,6 +38,20 @@
       "services": [
         { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
       ],
+      // Durable Object + its class migration are scoped to env.dev ONLY.
+      // `migrations` is an inheritable key, so declaring it here (and nowhere
+      // at the top level) guarantees the default/live script `mid-suggestion`
+      // never gains a DO namespace or a migration tag.
+      // Must be new_sqlite_classes — this account rejects KV-backed DOs.
+      "durable_objects": {
+        "bindings": [{ "name": "SYNC_DRIVER", "class_name": "SyncDriver" }]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SyncDriver"] }
+      ],
+      "r2_buckets": [
+        { "binding": "CSV_BUCKET", "bucket_name": "mid-suggestion-csv-staging" }
+      ],
       "observability": {
         "enabled": true
       }

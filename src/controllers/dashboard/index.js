@@ -46,10 +46,9 @@ export async function handleDashboard(request, env, url) {
   }
 
   if (p === "/api/overview-combos") {
-    const { combos, mids } = await loadCompanyData(env, companyId);
-    const bankIds = new Set(combos.map((c) => c.bank_id));
-    const banks = (await env.DB.prepare("SELECT id, name FROM banks").all()).results ?? [];
-    return jsonResponse({ combos, banks: banks.filter((b) => bankIds.has(b.id)), mids });
+    // loadCompanyData already trims banks to just the combo-referenced ones (Task 2).
+    const { combos, banks, mids } = await loadCompanyData(env, companyId);
+    return jsonResponse({ combos, banks, mids });
   }
 
   if (p === "/api/dataset") {
