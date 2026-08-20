@@ -179,6 +179,7 @@ export default {
     for (const co of companies) {
       let fromDate = startDate;
       let total = 0;
+      let done = false;
       for (let i = 0; i < CRON_MAX_CONTINUATIONS; i++) {
         const r = await ingestTransactions(env, {
           startDate,
@@ -193,8 +194,16 @@ export default {
           break;
         }
         total += r.totalFetched;
-        if (!r.hasMore) break;
+        if (!r.hasMore) { done = true; break; }
         fromDate = r.nextDate;
+      }
+      // Only stamp a pull that ran clean to the end of the window — a partial or failed
+      // pull must not look like a fresh one. Same rule as the manual ingest path.
+      // The dashboard reads this (/api/me, /api/settings) to show "last ingest".
+      if (done) {
+        await env.DB.prepare(
+          "UPDATE companies SET last_ingest_at = datetime('now') WHERE id = ?"
+        ).bind(co.id).run();
       }
       console.log(`[cron] company ${co.id} ingest — ${total} rows for ${startDate}..${endDate}`);
     }
