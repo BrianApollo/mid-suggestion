@@ -7,9 +7,10 @@
 //   - (100 - share + 1) .. 100  → serve the test MID
 //
 // So share=0 always serves the suggested MID, share=100 always serves the test MID.
+// Returns { mid, roll } so callers can surface the roll for debugging.
 export function pickTestMid(suggestedMid, testMid, share) {
   const s = Math.max(0, Math.min(100, Number(share) || 0));
   const threshold = 100 - s;                       // upper bound of the "suggested" band
   const roll = Math.floor(Math.random() * 100) + 1; // random integer in [1, 100]
-  return roll <= threshold ? suggestedMid : testMid;
+  return { mid: roll <= threshold ? suggestedMid : testMid, roll };
 }

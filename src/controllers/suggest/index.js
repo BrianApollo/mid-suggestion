@@ -51,12 +51,13 @@ export async function handleSuggest(request, env, url) {
   // (100 - share) per request to serve either the control MID or the test MID. One MID out.
   let midId = suggestedMid;
   let source = sugg.source;
+  let roll = null;
   const config = await loadCurrentConfig(env, companyId);
   const test = (config?.overrides || []).find(
     (o) => o.mode === "test" && Number(o.bankId) === Number(bank.bank_id)
   );
   if (test?.config?.mid != null) {
-    midId = pickTestMid(suggestedMid, test.config.mid, test.config.share ?? 15);
+    ({ mid: midId, roll } = pickTestMid(suggestedMid, test.config.mid, test.config.share ?? 15));
     source = "override:test";
   }
 
@@ -73,6 +74,7 @@ export async function handleSuggest(request, env, url) {
     issuer: bank.issuer,
     source,                              // additive — 'strategy' | 'override:test' | ...
     allocation: [{ mid: midId, pct: 100 }], // additive — the single MID actually served
+    roll,                                // additive — A/B roll in [1, 100]; null when no test override
   });
 }
 
