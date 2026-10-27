@@ -15,7 +15,7 @@
     }
   ],
   "services": [
-    { "binding": "CC_PROXY", "service": "checkout-champ-proxy" }
+    { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
   ],
   "observability": {
     "enabled": true
@@ -53,6 +53,41 @@
       "r2_buckets": [
         { "binding": "CSV_BUCKET", "bucket_name": "mid-suggestion-csv-staging" }
       ],
+      "observability": {
+        "enabled": true
+      }
+    },
+    // Apollo account (1b61024e…). Selected via CLOUDFLARE_ENV=apollo in .env (copy .env.apollo).
+    // `name` is pinned to the Worker already deployed on that account, so this redeploys it
+    // rather than creating mid-suggestion-apollo. Resources are Apollo's own.
+    "apollo": {
+      "name": "mid-suggestion",
+      "triggers": {
+        "crons": ["0 */1 * * *", "0 */12 * * *"]
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "apollo-mid-suggestion-db",
+          "database_id": "7ecc88bc-185e-4058-a040-5cb1ec505d32",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "services": [
+        { "binding": "CC_PROXY", "service": "checkout-champ-proxy-mt" }
+      ],
+      "durable_objects": {
+        "bindings": [{ "name": "SYNC_DRIVER", "class_name": "SyncDriver" }]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SyncDriver"] }
+      ],
+      "r2_buckets": [
+        { "binding": "CSV_BUCKET", "bucket_name": "bulktest" }
+      ],
+      // "vars": {
+      //   "AUTH_SECRET": "5f06bd588cbab815b721d809f812dae2a4ec92dc05f87e909b42ea0d25fcc76e"
+      // },
       "observability": {
         "enabled": true
       }
